@@ -3,12 +3,14 @@ import json
 import numpy as np
 from sklearn.model_selection import train_test_split
 import re
+import openpyxl
+import json
 
 """
 WoS Reference: https://github.com/kk7nc/HDLTex
 """
 
-FILE_DIR = 'Meta-data/Data.txt'
+FILE_DIR = 'Meta-data/Data.xlsx'
 total_len = []
 np.random.seed(7)
 
@@ -36,20 +38,12 @@ def clean_str(string):
     Original taken from https://github.com/yoonkim/CNN_sentence/blob/master/process_data.py
     """
     string = string.strip().strip('"')
-    # string = re.sub(r"[^A-Za-z0-9(),!?\.\'\`]", " ", string)
     string = re.sub(r"\'s", " \'s", string)
     string = re.sub(r"\'ve", " \'ve", string)
     string = re.sub(r"n\'t", " n\'t", string)
     string = re.sub(r"\'re", " \'re", string)
     string = re.sub(r"\'d", " \'d", string)
     string = re.sub(r"\'ll", " \'ll", string)
-    # string = re.sub(r",", " ", string)
-    # string = re.sub(r"\.", " ", string)
-    # string = re.sub(r"\"", " ", string)
-    # string = re.sub(r"!", " ", string)
-    # string = re.sub(r"\(", " ", string)
-    # string = re.sub(r"\)", " ", string)
-    # string = re.sub(r"\?", " ", string)
     string = re.sub(r"\s{2,}", " ", string)
     return string.strip().lower()
 
@@ -74,35 +68,24 @@ def get_data_from_meta():
         line = line.rstrip('\n')
         line = line.split('\t')
         assert len(line) == 7
-        sample_label = [line[3].rstrip().lstrip(), line[4].rstrip().lstrip()]
-        code = str(line[0]) + '-' + str(line[1])
+        sample_label = [line[3].rstrip().lstrip(), line[4].rstrip().lstrip()] # [domainlabel, area_label]
+        code = str(line[0]) + '-' + str(line[1]) # eg code 5-2
 
         if code in label_check.keys():
             if sample_label[1] not in label_check[code]:
-                label_check[code].append(sample_label[1])
+                label_check[code].append(sample_label[1])  #label_check[5-2] = [ area_label1, area_labels2]
         else:
             label_check[code] = [sample_label[1]]
         for i in label_check[code]:
             if stats[sample_label[0]][i] > stats[sample_label[0]][sample_label[1]]:
                 sample_label[1] = i
                 break
-        # if sample_label[1] == 'Underwater Windmill':
-        #     sample_label[1] = 'Water Pollution'
-        # if sample_label[1] == 'Bamboo as a Building Material':
-        #     sample_label[1] = 'Water Pollution'
-        # if sample_label[1] == 'Nano Concrete':
-        #     sample_label[1] = 'Smart Material'
-        # if sample_label[1] == 'Highway Network System':
-        #     sample_label[1] = 'Geotextile'
-        # if sample_label[1] == 'Transparent Concrete':
-        #     sample_label[1] = 'Smart Material'
-        # if sample_label[1] == 'Outdoor Health':
-        #     sample_label[1] = ''
         doc = line[6]
         doc = clean_str(doc)
         sample_text = doc
         total_len.append(len(sample_text))
         data.append({'doc_token': sample_text, 'doc_label': sample_label, 'doc_topic': [], 'doc_keyword': []})
+        # {doc_token: doc_string, doc_label: [domain_label, area_label]}
     print(label_check)
     c = 0
     for i in label_check.keys():
@@ -116,6 +99,65 @@ def get_data_from_meta():
         line = json.dumps(line)
         f.write(line + '\n')
     f.close()
+
+
+
+def read_excel_data(FILE_DIR):
+    # 加载 Excel 工作簿
+    wb = openpyxl.load_workbook(FILE_DIR)
+    ws = wb.active  # 获取活动工作表
+    
+    data = []
+    label_check = {}
+    total_len = []
+    
+    # 从第二行开始读取（跳过标题行）
+    for row in ws.iter_rows(min_row=2, values_only=True):
+        assert len(row) == 7  # 确保每行有7列
+        
+        sample_label = [str(row[3]).strip(), str(row[4]).strip()]  # [domainlabel, area_label]
+        code = f"{row[0]}-{row[1]}"  # eg code 5-2
+
+        if code in label_check:
+            if sample_label[1] not in label_check[code]:
+                label_check[code].append(sample_label[1])  # label_check[5-2] = [area_label1, area_labels2]
+        else:
+            label_check[code] = [sample_label[1]]
+            
+        for i in label_check[code]:
+            if stats[sample_label[0]][i] > stats[sample_label[0]][sample_label[1]]:
+                sample_label[1] = i
+                break
+                
+        doc = str(row[6])
+        doc = clean_str(doc)
+        sample_text = doc
+        total_len.append(len(sample_text))
+        
+        data.append({
+            'doc_token': sample_text,
+            'doc_label': sample_label,
+            'doc_topic': [],
+            'doc_keyword': []
+        })
+    
+    # 打印统计信息
+    print(label_check)
+    c = 0
+    for i in label_check.keys():
+        if len(label_check[i]) > 1:
+            print(i, label_check[i])
+            c += len(label_check[i]) - 1
+    print(c)
+    print(len(label_check.keys()))
+    
+    # 保存为JSON文件
+    with open('wos_total.json', 'w') as f:
+        for line in data:
+            f.write(json.dumps(line) + '\n')
+
+# # 使用示例
+# read_excel_data("your_file.xlsx")
 
 
 def split_train_dev_test():
@@ -161,7 +203,7 @@ def get_hierarchy():
         else:
             label_hierarchy['Root'].append(line[0])
             label_hierarchy[line[0]] = [line[1]]
-    f = open('wos.taxnomy', 'w')
+    f = open('wos.taxnomy', 'w') # root labela labelb labelc
     for i in label_hierarchy.keys():
         line = [i]
         line.extend(label_hierarchy[i])
@@ -171,6 +213,7 @@ def get_hierarchy():
 
 
 if __name__ == '__main__':
-    get_data_from_meta()
+    # get_data_from_meta()
+    read_excel_data(FILE_DIR)
     get_hierarchy()
     split_train_dev_test()

@@ -1,0 +1,65 @@
+// {
+//     // Use IntelliSense to learn about possible attributes.
+//     // Hover to view descriptions of existing attributes.
+//     // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+//     "version": "0.2.0",
+//     "configurations": [
+
+//         {
+//             "name": "Python Debugger: Current File with Arguments",
+//             "type": "debugpy",
+//             "request": "launch",
+//             "program": "${file}",
+//             "console": "integratedTerminal",
+//             "args": "${command:pickArgs}"
+//         }
+//     ]
+// }
+
+
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Python: Run with Args",
+            "type": "debugpy", //python
+            "request": "launch",
+            "program": "run.py",
+            "console": "integratedTerminal",
+            "args": [
+                "--train_file", "./data/WebOfScience/wos_train_generated_tl.json",
+                "--output_dir", "models/wos",
+                "--model_type", "bert",
+                "--model_name_or_path", "bert-base-uncased",
+                "--do_lower_case",
+                "--max_source_seq_length", "509",
+                "--max_target_seq_length", "3",
+                "--per_gpu_train_batch_size", "12",
+                "--gradient_accumulation_steps", "1",
+                "--valid_file", "./data/WebOfScience/wos_val_generated.json",
+                "--test_file", "./data/WebOfScience/wos_test_generated.json",
+                "--add_vocab_file", "./data/WebOfScience/label_map.pkl",
+                "--label_smoothing", "0",
+                "--wandb",
+                "--learning_rate", "3e-5",
+                "--num_warmup_steps", "500",
+                "--num_training_steps", "96000",
+                "--cache_dir", "cache",
+                "--random_prob", "0",
+                "--keep_prob", "0",
+                "--soft_label",
+                "--seed", "42",
+                "--label_cpt", "./data/WebOfScience/wos.taxnomy",
+                "--label_cpt_not_incr_mask_ratio",
+                "--label_cpt_steps", "300",
+                "--label_cpt_use_bce"
+            ],
+            "env": {
+                "TRAIN_FILE": "./data/WebOfScience/wos_train_generated_tl.json",
+                "OUTPUT_DIR": "models/wos",
+                "CACHE_DIR": "cache",
+                "seed": "42"
+            }
+        }
+    ]
+}

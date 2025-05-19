@@ -1,0 +1,6 @@
+s2s_ft/__pycache__
+cache/
+wandb/
+*pt
+.cache/
+models/

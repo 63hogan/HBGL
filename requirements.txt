@@ -5,3 +5,7 @@ tqdm
 wandb
 sentencepiece
 transformers==2.10.0
+torch
+scikit-learn
+openpyxl
+# wandb 1ff147db6c26f97d3c89d4b76194402e05c67139
