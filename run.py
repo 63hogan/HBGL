@@ -17,8 +17,11 @@ import tqdm
 
 from s2s_ft.modeling import BertForSequenceToSequenceWithPseudoMask, BertForSequenceToSequenceUniLMV1
 from transformers import AdamW, get_linear_schedule_with_warmup
-from transformers import BertConfig, BertTokenizer
-
+# from transformers import BertConfig, BertTokenizer
+from transformers import \
+    RobertaConfig, BertConfig, \
+    BertTokenizer, RobertaTokenizer
+    
 from s2s_ft import utils
 from s2s_ft.config import BertForSeq2SeqConfig
 
@@ -29,6 +32,7 @@ logging.basicConfig(level=LOGLEVEL)
 
 MODEL_CLASSES = {
     'bert': (BertConfig, BertTokenizer),
+    'roberta': (RobertaConfig, BertTokenizer),
 }
 
 def training_cpt(args, tokenizer, input_ids, attention_mask,  position_ids, _init_label_emb, num_hiers, reversed_hiers):
@@ -628,8 +632,7 @@ def get_model_and_tokenizer(args):
     logger.info("Model config for seq2seq: %s", str(config))
 
     tokenizer = tokenizer_class.from_pretrained(
-        args.tokenizer_name if args.tokenizer_name else args.model_name_or_path,
-        do_lower_case=args.do_lower_case, cache_dir=args.cache_dir if args.cache_dir else None)
+        args.model_name_or_path)
 
     model_class = \
         BertForSequenceToSequenceWithPseudoMask if args.mask_way == 'v2' \
@@ -639,6 +642,7 @@ def get_model_and_tokenizer(args):
 
     model = model_class.from_pretrained(
         args.model_name_or_path, config=config, model_type=args.model_type,
+        # args.model_name_or_path, config=config, model_type='roberta',
         reuse_position_embedding=True,
         cache_dir=args.cache_dir if args.cache_dir else None)
 
