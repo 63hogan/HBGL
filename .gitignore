@@ -5,3 +5,4 @@ wandb/
 .cache/
 models/
 data/ztfData/
+HBGL.tar
