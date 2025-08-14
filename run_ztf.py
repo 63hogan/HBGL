@@ -57,12 +57,12 @@ def training_cpt(args, tokenizer, input_ids, attention_mask,  position_ids, _ini
     b_input_ids = input_ids.unsqueeze(0).repeat(bs, 1).cuda().long()
     position_ids = position_ids.unsqueeze(0).repeat(bs, 1).cuda().long()
 
-    if args.label_cpt_decodewithpos: #False
+    if args.label_cpt_decodewithpos:
         position_ids[:, 1:-1] += args.max_source_seq_length - 1
         position_ids[:, -1] = args.max_source_seq_length + args.max_target_seq_length - 1
     attention_mask = attention_mask.unsqueeze(0).repeat(bs, 1, 1).cuda().long()
     for step in range(args.label_cpt_steps):
-        if args.label_cpt_not_incr_mask_ratio: #False
+        if args.label_cpt_not_incr_mask_ratio:
             c_mask_ratio = mask_ratio
         else:
             c_mask_ratio = mask_ratio + (step / args.label_cpt_steps) * 0.3
@@ -73,11 +73,9 @@ def training_cpt(args, tokenizer, input_ids, attention_mask,  position_ids, _ini
         mask_tokens = ~torch.bernoulli(torch.ones_like(b_input_ids) * (1 - c_mask_ratio)).bool()
         labels = torch.ones_like(b_input_ids).long() * -100
         # keep cls & sep unmask
-        #TODO Debug
-        mask_tokens[:, 1] = 1
         mask_tokens[:, 0] = 0
         mask_tokens[:, -1] = 0
-        labels[mask_tokens] = b_input_ids[mask_tokens] - model.bert.embeddings.word_embeddings.num_embeddings #从 0 开始
+        labels[mask_tokens] = b_input_ids[mask_tokens] - model.bert.embeddings.word_embeddings.num_embeddings
         inputs_embeds[mask_tokens] = model.bert.embeddings.word_embeddings.weight[tokenizer.mask_token_id]
         outputs = model.bert(
             None,
@@ -89,7 +87,7 @@ def training_cpt(args, tokenizer, input_ids, attention_mask,  position_ids, _ini
         hidden_states = model.cls.predictions.transform(sequence_output)
         prediction_scores = hidden_states @ init_label_emb.T
 
-        if args.label_cpt_use_bce: #True
+        if args.label_cpt_use_bce:
             loss_fct = BCEWithLogitsLoss()  # -100 index = padding token
             with torch.no_grad():
                 bce_labels = torch.zeros_like(prediction_scores)
@@ -100,9 +98,9 @@ def training_cpt(args, tokenizer, input_ids, attention_mask,  position_ids, _ini
                     c = defaultdict(list)
                     lmap = {}
                     for il in l:
-                        if il not in num_hiers: #叶子节点
+                        if il not in num_hiers:
                             # last labels
-                            p = reversed_hiers[il] # il 的父节点  #TODO 序号不对
+                            p = reversed_hiers[il]
                             c[p].append(il)
                             lmap[il] = p
                     for i, il in enumerate(l):
@@ -709,10 +707,7 @@ def get_model_and_tokenizer(args):
             label_mask = label_name_tensors != tokenizer.pad_token_id
             init_label_emb = (label_mask.unsqueeze(-1) * init_label_emb).sum(1)
         label_tokens = [i for i in range(len(label_map))]
-        #tokenizer.add_tokens([label_map[label] for label in labels_key])
-        for label in labels_key:
-            token = label_map[label]
-            tokenizer.add_tokens([token.lower()])
+        tokenizer.add_tokens([label_map[label] for label in labels_key])
         #import pdb;pdb.set_trace()
         #labels_embeds = torch.nn.Embedding(len(label_tokens), config.hidden_size).weight.data
         if args.label_cpt:
@@ -741,7 +736,7 @@ def get_model_and_tokenizer(args):
                     return [a,] + _loop(r_hiera[a])
                 else:
                     return [a]
-            label_class = {} #每个 labal 的level, root 0
+            label_class = {} #每个 labal 的level
             for i in _label_dict:
                 label_class[i] = len(_loop(i))
             # cls l1 l2 l3 sep

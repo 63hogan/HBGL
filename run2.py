@@ -36,16 +36,26 @@ MODEL_CLASSES = {
 }
 
 def training_cpt(args, tokenizer, input_ids, attention_mask,  position_ids, _init_label_emb, num_hiers, reversed_hiers):
+    """
+    Trains label embeddings for a single batch of labels.
+    This function is called iteratively by get_model_and_tokenizer.
+    """
     from transformers import BertForMaskedLM
     from torch.nn import CrossEntropyLoss, BCEWithLogitsLoss
+    
+    # label_nums is the number of labels in the current batch
     label_nums = input_ids.shape[0] - 2
+
+    # If there are no labels in this batch, no training is needed.
+    if label_nums <= 0:
+        return _init_label_emb.cpu()
 
     model = BertForMaskedLM.from_pretrained(args.model_name_or_path)
     model = model.train()
     model.cuda()
 
+    # The input _init_label_emb is already a slice for the current batch
     init_label_emb = _init_label_emb.float().cuda().requires_grad_()
-    torch.save(init_label_emb.cpu(), 'label_name_emb_before_train.pt')
 
     optimizer_grouped_parameters = [
         {'params': [init_label_emb, ], 'weight_decay': 0.0}
@@ -57,28 +67,41 @@ def training_cpt(args, tokenizer, input_ids, attention_mask,  position_ids, _ini
     b_input_ids = input_ids.unsqueeze(0).repeat(bs, 1).cuda().long()
     position_ids = position_ids.unsqueeze(0).repeat(bs, 1).cuda().long()
 
-    if args.label_cpt_decodewithpos: #False
+    if args.label_cpt_decodewithpos:
         position_ids[:, 1:-1] += args.max_source_seq_length - 1
         position_ids[:, -1] = args.max_source_seq_length + args.max_target_seq_length - 1
     attention_mask = attention_mask.unsqueeze(0).repeat(bs, 1, 1).cuda().long()
+    
     for step in range(args.label_cpt_steps):
-        if args.label_cpt_not_incr_mask_ratio: #False
+        if args.label_cpt_not_incr_mask_ratio:
             c_mask_ratio = mask_ratio
         else:
             c_mask_ratio = mask_ratio + (step / args.label_cpt_steps) * 0.3
-        inputs_embeds = torch.cat([model.bert.embeddings.word_embeddings.weight[tokenizer.cls_token_id].unsqueeze(0),
-                                   init_label_emb,
-                                   model.bert.embeddings.word_embeddings.weight[tokenizer.sep_token_id].unsqueeze(0),])
+        
+        # Get embeddings for special tokens from the base model
+        cls_emb = model.bert.embeddings.word_embeddings.weight[tokenizer.cls_token_id].unsqueeze(0)
+        sep_emb = model.bert.embeddings.word_embeddings.weight[tokenizer.sep_token_id].unsqueeze(0)
+        mask_emb = model.bert.embeddings.word_embeddings.weight[tokenizer.mask_token_id]
+
+        # Construct the initial input embeddings for the sequence of labels
+        inputs_embeds = torch.cat([cls_emb, init_label_emb, sep_emb])
         inputs_embeds = inputs_embeds.unsqueeze(0).repeat(bs, 1, 1).cuda()
+
         mask_tokens = ~torch.bernoulli(torch.ones_like(b_input_ids) * (1 - c_mask_ratio)).bool()
         labels = torch.ones_like(b_input_ids).long() * -100
-        # keep cls & sep unmask
-        #TODO Debug
-        mask_tokens[:, 1] = 1
+        # Keep [CLS] and [SEP] tokens unmasked
         mask_tokens[:, 0] = 0
         mask_tokens[:, -1] = 0
-        labels[mask_tokens] = b_input_ids[mask_tokens] - model.bert.embeddings.word_embeddings.num_embeddings #从 0 开始
-        inputs_embeds[mask_tokens] = model.bert.embeddings.word_embeddings.weight[tokenizer.mask_token_id]
+        
+        # Create labels for the masked language model loss. The label for a masked token
+        # is its own position index within the sequence of labels (from 0 to label_nums-1).
+        masked_indices = torch.nonzero(mask_tokens, as_tuple=False)
+        if masked_indices.numel() > 0:
+            # The label sequence starts at index 1 (after [CLS])
+            labels[masked_indices[:, 0], masked_indices[:, 1]] = masked_indices[:, 1] - 1
+        
+        inputs_embeds[mask_tokens] = mask_emb
+
         outputs = model.bert(
             None,
             attention_mask=attention_mask,
@@ -89,22 +112,23 @@ def training_cpt(args, tokenizer, input_ids, attention_mask,  position_ids, _ini
         hidden_states = model.cls.predictions.transform(sequence_output)
         prediction_scores = hidden_states @ init_label_emb.T
 
-        if args.label_cpt_use_bce: #True
-            loss_fct = BCEWithLogitsLoss()  # -100 index = padding token
+        if args.label_cpt_use_bce:
+            loss_fct = BCEWithLogitsLoss()
             with torch.no_grad():
                 bce_labels = torch.zeros_like(prediction_scores)
                 _bce_labels = []
                 for b in range(bs):
-                    l = labels[b][mask_tokens[b]].tolist()
-                    bce_l = bce_labels[b][mask_tokens[b]]
+                    b_mask_tokens_indices = torch.nonzero(mask_tokens[b], as_tuple=True)[0]
+                    l = labels[b][b_mask_tokens_indices].tolist()
+                    bce_l = bce_labels[b][b_mask_tokens_indices]
                     c = defaultdict(list)
                     lmap = {}
-                    for il in l:
-                        if il not in num_hiers: #叶子节点
-                            # last labels
-                            p = reversed_hiers[il] # il 的父节点  #TODO 序号不对
-                            c[p].append(il)
-                            lmap[il] = p
+                    for il in l: # il is a local index from 0 to label_nums-1
+                        if il not in num_hiers:
+                            if il in reversed_hiers:
+                                p = reversed_hiers[il]
+                                c[p].append(il)
+                                lmap[il] = p
                     for i, il in enumerate(l):
                         if il not in lmap:
                             bce_l[i][il] = 1
@@ -112,20 +136,28 @@ def training_cpt(args, tokenizer, input_ids, attention_mask,  position_ids, _ini
                             for j in c[lmap[il]]:
                                 bce_l[i][j] = 1
                     _bce_labels.append(bce_l)
-                bce_labels = torch.cat(_bce_labels, dim=0)
-                print(bce_labels.sum())
-            masked_lm_loss = loss_fct(prediction_scores[mask_tokens], bce_labels)
+                
+                if _bce_labels:
+                    bce_labels = torch.cat(_bce_labels, dim=0)
+                    masked_lm_loss = loss_fct(prediction_scores[mask_tokens], bce_labels)
+                else:
+                    masked_lm_loss = torch.tensor(0.0, device=init_label_emb.device)
         else:
-            loss_fct = CrossEntropyLoss()  # -100 index = padding token
+            loss_fct = CrossEntropyLoss()  # -100 index is ignored
             masked_lm_loss = loss_fct(prediction_scores.view(-1, label_nums), labels.view(-1))
+        
+        if torch.isnan(masked_lm_loss):
+            continue
 
         masked_lm_loss.backward()
         cpt_optimizer.step()
         model.zero_grad()
         init_label_emb.grad = None
         print(f'step {step}', masked_lm_loss.item())
-    torch.save(init_label_emb.cpu(), 'label_name_emb_after_train.pt')
-    return init_label_emb
+        
+    # Return the trained embeddings for this batch, moved to CPU
+    return init_label_emb.detach().cpu()
+
 
 def prepare_for_training(args, model, checkpoint_state_dict, amp):
     no_decay = ['bias', 'LayerNorm.weight']
@@ -251,7 +283,7 @@ def train(args, training_features, model, tokenizer):
     logger.info("Mode = %s" % str(model))
 
     # Train!
-    logger.info("  ***** Running training *****  *")
+    logger.info("  ***** Running training ***** *")
     logger.info("  Num examples = %d", len(training_features))
     logger.info("  Num Epochs = %.2f", len(train_dataset) / len(training_features))
     logger.info("  Instantaneous batch size per GPU = %d", args.per_gpu_train_batch_size)
@@ -709,16 +741,13 @@ def get_model_and_tokenizer(args):
             label_mask = label_name_tensors != tokenizer.pad_token_id
             init_label_emb = (label_mask.unsqueeze(-1) * init_label_emb).sum(1)
         label_tokens = [i for i in range(len(label_map))]
-        #tokenizer.add_tokens([label_map[label] for label in labels_key])
-        for label in labels_key:
-            token = label_map[label]
-            tokenizer.add_tokens([token.lower()])
-        #import pdb;pdb.set_trace()
-        #labels_embeds = torch.nn.Embedding(len(label_tokens), config.hidden_size).weight.data
+        tokenizer.add_tokens([label_map[label] for label in labels_key])
+        
         if args.label_cpt:
             # for compare with same seed
             rng_state = torch.get_rng_state()
 
+            # --- 1. Load full hierarchy data from file ---
             from collections import defaultdict
             hiera = defaultdict(set)
             _label_dict = {}
@@ -731,42 +760,110 @@ def get_model_and_tokenizer(args):
                             _label_dict[i] = len(_label_dict) - 1
                         hiera[line[0]].add(i)
                 _label_dict.pop('Root')
+            
             r_hiera = {}
             for i in hiera:
                 for j in list(hiera[i]):
                     r_hiera[j] = i
 
             def _loop(a):
-                if r_hiera[a] != 'Root':
+                if a in r_hiera and r_hiera[a] != 'Root':
                     return [a,] + _loop(r_hiera[a])
                 else:
                     return [a]
-            label_class = {} #每个 labal 的level, root 0
+
+            label_class = {} # Get the level for each label
             for i in _label_dict:
                 label_class[i] = len(_loop(i))
-            # cls l1 l2 l3 sep
-            attention_mask = torch.zeros((len(label_tokens) + 2, len(label_tokens) + 2))
-            num_hiers = defaultdict(set)
-            reversed_hiers = {}
-            for hi in hiera:
-                for hj in list(hiera[hi]):
-                    def _label_map_f(x):
-                        if x == 'Root': return -1
-                        return int(label_map[x].replace('[A_', '').replace(']', ''))
-                    attention_mask[_label_map_f(hi) + 1][_label_map_f(hj) + 1] = 1
-                    num_hiers[_label_map_f(hi) + 1].add(_label_map_f(hj) + 1)
-                    reversed_hiers[_label_map_f(hj) + 1] = _label_map_f(hi) + 1
-                    if args.label_cpt_use_bce:
-                        attention_mask[_label_map_f(hj) + 1][_label_map_f(hi) + 1] = 1
-            input_ids = torch.LongTensor(tokenizer.encode(' '.join(label_map.values()).lower()))
-            assert len(input_ids) == len(labels_key) + 2
-            position_ids = torch.LongTensor([0, ] + [label_class[i] for i in labels_key] + [max(label_class.values()) + 1,])
 
-            init_label_emb = training_cpt(args, tokenizer, input_ids, attention_mask,
-                                            position_ids, init_label_emb, num_hiers, reversed_hiers).detach().cpu()
+            # --- 2. Start batching logic to handle large number of labels ---
+            # `labels_key` is a list of all label names, defined above
+            # `init_label_emb` is the full embedding tensor, also defined above
+            # `label_map` maps label name to a special token string like '[A_xxx]'
+
+            # Set a batch size that is safely within BERT's max sequence length
+            max_labels_in_batch = 500 
+            trained_label_emb = torch.zeros_like(init_label_emb)
+            
+            # Create a mapping from the label name (string) to its original index (0 to N-1)
+            label_name_to_original_idx = {name: i for i, name in enumerate(labels_key)}
+
+            logger.info(f"Starting batched label training. Total labels: {len(labels_key)}. Batch size: {max_labels_in_batch}")
+
+            # Iterate through all labels in batches
+            for i in range(0, len(labels_key), max_labels_in_batch):
+                batch_labels_keys = labels_key[i:i + max_labels_in_batch]
+                batch_original_indices = [label_name_to_original_idx[name] for name in batch_labels_keys]
+                
+                logger.info(f"  Training batch {i // max_labels_in_batch + 1}, labels from {i} to {i + len(batch_labels_keys)}")
+
+                if not batch_labels_keys:
+                    continue
+
+                # Map from label name to its index WITHIN the current batch (0 to batch_size-1)
+                label_name_to_batch_idx = {name: j for j, name in enumerate(batch_labels_keys)}
+
+                # --- 3. Prepare all necessary inputs for the current batch ---
+                
+                # a. Get the initial embeddings for the current batch of labels
+                batch_init_label_emb = init_label_emb[batch_original_indices]
+
+                # b. Build attention mask and hierarchy dictionaries for this specific batch
+                batch_attention_mask = torch.zeros((len(batch_labels_keys) + 2, len(batch_labels_keys) + 2))
+                batch_num_hiers = defaultdict(set)
+                batch_reversed_hiers = {}
+
+                def _label_map_f_batch(label_name):
+                    if label_name == 'Root': return -1
+                    return label_name_to_batch_idx.get(label_name, -999)
+
+                for parent_label, child_labels in hiera.items():
+                    for child_label in list(child_labels):
+                        # A hierarchical connection is only added if both parent and child are in the current batch
+                        if parent_label in label_name_to_batch_idx and child_label in label_name_to_batch_idx:
+                            parent_batch_idx = _label_map_f_batch(parent_label)
+                            child_batch_idx = _label_map_f_batch(child_label)
+                            
+                            # Add 1 to all indices to account for the [CLS] token at position 0
+                            batch_attention_mask[parent_batch_idx + 1][child_batch_idx + 1] = 1
+                            batch_num_hiers[parent_batch_idx].add(child_batch_idx)
+                            batch_reversed_hiers[child_batch_idx] = parent_batch_idx
+                            if args.label_cpt_use_bce:
+                                batch_attention_mask[child_batch_idx + 1][parent_batch_idx + 1] = 1
+                
+                # c. Build input_ids and position_ids for the batch
+                batch_label_tokens = [label_map[name] for name in batch_labels_keys]
+                batch_input_ids_str = ' '.join(batch_label_tokens).lower()
+                # Encode tokens without adding special tokens automatically
+                encoded_tokens = tokenizer.encode(batch_input_ids_str, add_special_tokens=False)
+                # Manually add [CLS] and [SEP] token IDs to have full control
+                batch_input_ids = torch.LongTensor([tokenizer.cls_token_id] + encoded_tokens + [tokenizer.sep_token_id])
+                
+                assert len(batch_input_ids) == len(batch_labels_keys) + 2
+
+                batch_label_classes = [label_class[name] for name in batch_labels_keys]
+                max_level_in_batch = max(batch_label_classes) if batch_label_classes else 0
+                batch_position_ids = torch.LongTensor([0] + batch_label_classes + [max_level_in_batch + 1])
+
+                # --- 4. Call the training function for the current batch ---
+                updated_batch_emb = training_cpt(
+                    args, tokenizer, batch_input_ids, batch_attention_mask,
+                    batch_position_ids, batch_init_label_emb, 
+                    batch_num_hiers, batch_reversed_hiers
+                )
+
+                # --- 5. Store the returned (trained) embeddings back into the full tensor at their original positions ---
+                trained_label_emb[batch_original_indices] = updated_batch_emb
+
+            # After the loop finishes, the full `trained_label_emb` tensor contains the updated embeddings for all labels
+            init_label_emb = trained_label_emb.detach().cpu()
+            
+            # Save the final combined embeddings to file
+            torch.save(init_label_emb, 'label_name_emb_after_train.pt')
 
             # for compare with same seed
             torch.set_rng_state(rng_state)
+
         elif args.random_label_init:
             rng_state = torch.get_rng_state()
             init_label_emb = torch.nn.Embedding(len(label_tokens), config.hidden_size).weight.data
