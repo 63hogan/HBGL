@@ -73,8 +73,6 @@ def training_cpt(args, tokenizer, input_ids, attention_mask,  position_ids, _ini
         mask_tokens = ~torch.bernoulli(torch.ones_like(b_input_ids) * (1 - c_mask_ratio)).bool()
         labels = torch.ones_like(b_input_ids).long() * -100
         # keep cls & sep unmask
-        #TODO Debug
-        mask_tokens[:, 1] = 1
         mask_tokens[:, 0] = 0
         mask_tokens[:, -1] = 0
         labels[mask_tokens] = b_input_ids[mask_tokens] - model.bert.embeddings.word_embeddings.num_embeddings #从 0 开始
