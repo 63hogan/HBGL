@@ -21,14 +21,25 @@ from transformers import AdamW, get_linear_schedule_with_warmup
 from transformers import \
     RobertaConfig, BertConfig, \
     BertTokenizer, RobertaTokenizer
+from transformers import BertForMaskedLM
+from torch.nn import CrossEntropyLoss, BCEWithLogitsLoss
     
 from s2s_ft import utils
 from s2s_ft.config import BertForSeq2SeqConfig
+from collections import defaultdict
 
-LOGLEVEL = os.environ.get('LOGLEVEL', 'INFO').upper()
-logger = logging.getLogger(__name__)
-logging.basicConfig(level=LOGLEVEL)
+from data_tool import *
 
+FORMAT = '%(asctime)s[%(name)s.%(funcName)s]%(levelname)s: %(message)s'
+
+
+# 使用 basicConfig 应用格式
+logging.basicConfig(level=logging.INFO, format=FORMAT)
+# 配置 logging
+logging.basicConfig(
+    level=logging.INFO,  # 设置最低记录级别为 DEBUG，所有级别的日志都会显示
+    format='%(asctime)s - %(levelname)s - [%(module)s:%(lineno)d] - %(message)s' # 设置日志格式
+)
 
 MODEL_CLASSES = {
     'bert': (BertConfig, BertTokenizer),
@@ -36,8 +47,7 @@ MODEL_CLASSES = {
 }
 
 def training_cpt(args, tokenizer, input_ids, attention_mask,  position_ids, _init_label_emb, num_hiers, reversed_hiers):
-    from transformers import BertForMaskedLM
-    from torch.nn import CrossEntropyLoss, BCEWithLogitsLoss
+
     label_nums = input_ids.shape[0] - 2
 
     model = BertForMaskedLM.from_pretrained(args.model_name_or_path)
@@ -100,7 +110,7 @@ def training_cpt(args, tokenizer, input_ids, attention_mask,  position_ids, _ini
                     for il in l:
                         if il not in num_hiers: #叶子节点
                             # last labels
-                            p = reversed_hiers[il] # il 的父节点  #TODO 序号不对
+                            p = reversed_hiers[il] # il 的父节点  
                             c[p].append(il)
                             lmap[il] = p
                     for i, il in enumerate(l):
@@ -111,7 +121,7 @@ def training_cpt(args, tokenizer, input_ids, attention_mask,  position_ids, _ini
                                 bce_l[i][j] = 1
                     _bce_labels.append(bce_l)
                 bce_labels = torch.cat(_bce_labels, dim=0)
-                print(bce_labels.sum())
+                logging.info(bce_labels.sum())
             masked_lm_loss = loss_fct(prediction_scores[mask_tokens], bce_labels)
         else:
             loss_fct = CrossEntropyLoss()  # -100 index = padding token
@@ -121,9 +131,277 @@ def training_cpt(args, tokenizer, input_ids, attention_mask,  position_ids, _ini
         cpt_optimizer.step()
         model.zero_grad()
         init_label_emb.grad = None
+        logging.info("step %d, masked_lm_loss: %f", step, masked_lm_loss.item())
         print(f'step {step}', masked_lm_loss.item())
+        # logging.info(f"step {step}, masked_lm_loss: {masked_lm_loss.item()}")
     torch.save(init_label_emb.cpu(), 'label_name_emb_after_train.pt')
     return init_label_emb
+
+
+def train_batch_labels(args, tokenizer, input_ids, attention_mask,  position_ids, _init_label_emb, label_child_set, label_parent_dic):
+
+    label_nums = input_ids.shape[0] - 2
+
+    model = BertForMaskedLM.from_pretrained(args.model_name_or_path)
+    model = model.train()
+    model.cuda()
+
+    init_label_emb = _init_label_emb.float().cuda().requires_grad_()
+    # torch.save(init_label_emb.cpu(), 'label_name_emb_before_train.pt')
+
+    optimizer_grouped_parameters = [
+        {'params': [init_label_emb, ], 'weight_decay': 0.0}
+    ]
+    cpt_optimizer = AdamW(optimizer_grouped_parameters, lr=args.label_cpt_lr, eps=args.adam_epsilon)
+
+    mask_ratio = 0.15
+    bs = args.label_cpt_bsz
+    b_input_ids = input_ids.unsqueeze(0).repeat(bs, 1).cuda().long()
+    position_ids = position_ids.unsqueeze(0).repeat(bs, 1).cuda().long()
+    attention_mask = attention_mask.unsqueeze(0).repeat(bs, 1, 1).cuda().long()
+    
+    
+    for step in range(args.label_cpt_steps):
+        if args.label_cpt_not_incr_mask_ratio: #False
+            c_mask_ratio = mask_ratio
+        else:
+            c_mask_ratio = mask_ratio + (step / args.label_cpt_steps) * 0.3
+        inputs_embeds = torch.cat([model.bert.embeddings.word_embeddings.weight[tokenizer.cls_token_id].unsqueeze(0),
+                                   init_label_emb,
+                                   model.bert.embeddings.word_embeddings.weight[tokenizer.sep_token_id].unsqueeze(0),])
+        
+        inputs_embeds = inputs_embeds.unsqueeze(0).repeat(bs, 1, 1).cuda()
+        
+        mask_tokens = ~torch.bernoulli(torch.ones_like(b_input_ids) * (1 - c_mask_ratio)).bool()
+        labels = torch.ones_like(b_input_ids).long() * -100
+        # keep cls & sep unmask
+        mask_tokens[:, 0] = 0
+        mask_tokens[:, -1] = 0
+        
+        # labels[mask_tokens] = b_input_ids[mask_tokens] - model.bert.embeddings.word_embeddings.num_embeddings #从 0 开始
+        
+        masked_indices = torch.nonzero(mask_tokens, as_tuple=False)
+        if masked_indices.numel() > 0:
+            labels[masked_indices[:, 0], masked_indices[:, 1]] = masked_indices[:, 1] - 1
+        
+        inputs_embeds[mask_tokens] = model.bert.embeddings.word_embeddings.weight[tokenizer.mask_token_id]
+        
+        outputs = model.bert(
+            None,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            inputs_embeds=inputs_embeds,
+        )
+        sequence_output = outputs[0]
+        hidden_states = model.cls.predictions.transform(sequence_output)
+        prediction_scores = hidden_states @ init_label_emb.T
+
+        if args.label_cpt_use_bce: #True
+            loss_fct = BCEWithLogitsLoss()  # -100 index = padding token
+            with torch.no_grad():
+                bce_labels = torch.zeros_like(prediction_scores)
+                _bce_labels = []
+                for b in range(bs):
+                    # l = labels[b][mask_tokens[b]].tolist()
+                    # bce_l = bce_labels[b][mask_tokens[b]]
+                    
+                    b_mask_tokens_indices = torch.nonzero(mask_tokens[b], as_tuple=True)[0]
+                    l = labels[b][b_mask_tokens_indices].tolist()
+                    bce_l = bce_labels[b][b_mask_tokens_indices]
+                    
+                    
+                    c = defaultdict(list)
+                    lmap = {}
+                    for il in l:
+                        if il not in label_child_set: #叶子节点
+                            # last labels
+                            if il in label_parent_dic:
+                                p = label_parent_dic[il] # il 的父节点  
+                                c[p].append(il)
+                                lmap[il] = p
+                    
+                    for i, il in enumerate(l):
+                        if il not in lmap:
+                            bce_l[i][il] = 1
+                        else:
+                            for j in c[lmap[il]]:
+                                bce_l[i][j] = 1
+                    _bce_labels.append(bce_l)
+                bce_labels = torch.cat(_bce_labels, dim=0)
+                # logging.info(bce_labels.sum())
+            masked_lm_loss = loss_fct(prediction_scores[mask_tokens], bce_labels)
+        else:
+            loss_fct = CrossEntropyLoss()  # -100 index = padding token
+            masked_lm_loss = loss_fct(prediction_scores.view(-1, label_nums), labels.view(-1))
+
+        masked_lm_loss.backward()
+        cpt_optimizer.step()
+        model.zero_grad()
+        init_label_emb.grad = None
+        logging.info("step %d, masked_lm_loss: %f", step, masked_lm_loss.item())
+        # print(f'step {step}', masked_lm_loss.item())
+        # logging.info(f'step {step}, masked_lm_loss.item()')
+    # torch.save(init_label_emb.cpu(), 'label_name_emb_after_train.pt')
+    return init_label_emb.detach().cpu()
+
+
+def train_label_name_embedding(args):
+    config_class, tokenizer_class = MODEL_CLASSES[args.model_type]
+    model_config = config_class.from_pretrained(
+        args.config_name if args.config_name else args.model_name_or_path,
+        cache_dir=args.cache_dir if args.cache_dir else None)
+    config = BertForSeq2SeqConfig.from_exist_config(
+        config=model_config, label_smoothing=args.label_smoothing,
+        fix_word_embedding=args.fix_word_embedding,
+        max_position_embeddings=args.max_source_seq_length + args.max_target_seq_length)
+
+    logging.info("Model config for seq2seq: %s", str(config))
+
+    tokenizer = tokenizer_class.from_pretrained(
+        args.model_name_or_path)
+
+    model_class = \
+        BertForSequenceToSequenceWithPseudoMask if args.mask_way == 'v2' \
+            else BertForSequenceToSequenceUniLMV1
+
+    logging.info("Construct model %s" % model_class.MODEL_NAME)
+
+    model = model_class.from_pretrained(
+        args.model_name_or_path, config=config, model_type=args.model_type,
+        # args.model_name_or_path, config=config, model_type='roberta',
+        reuse_position_embedding=True,
+        cache_dir=args.cache_dir if args.cache_dir else None)
+
+    if args.add_vocab_file:
+        ztf_map = read_key_value_file(args.ztf_path)
+        label_name_set = get_uniq_train_cls_from_json(args.train_data_path)
+        _, label_name_parent_dic = get_ztf_hierarchy_info(ztf_map)
+        label_name_child_hiera_set, _ = get_train_labels_hiera_info(label_name_set,ztf_map)
+        label_idx_dic = get_label_idx(label_name_child_hiera_set)
+        
+        label_tokens_start_index  = model.bert.embeddings.word_embeddings.num_embeddings
+        label_name_tensors = []
+        max_l = -1
+
+        label_name_cnt = check_cnt(label_name_child_hiera_set)
+        assert(label_name_cnt == len(label_idx_dic))
+
+
+        for label_name in label_idx_dic.keys():
+            parents = []
+            l = label_name
+            while label_name_parent_dic[l] != 'root':
+                parents.append(label_name_parent_dic[l])
+                l = label_name_parent_dic[l]
+            parents.reverse()
+            parents.append(label_name)
+            label_str = ''
+            for l in parents:
+                label_str += ztf_map[l] + ' '
+            label_str = label_str.strip()
+            label_name_tensors.append(tokenizer.encode(label_str, add_special_tokens=False))
+            max_l = max(len(label_name_tensors[-1]), max_l)
+        label_name_tensors = torch.LongTensor([i + [tokenizer.pad_token_id] * (max_l - len(i)) for i in label_name_tensors])
+
+        with torch.no_grad():
+            init_label_emb = model.bert.embeddings.word_embeddings(label_name_tensors)
+            label_mask = label_name_tensors != tokenizer.pad_token_id
+            init_label_emb = (label_mask.unsqueeze(-1) * init_label_emb).sum(1) / label_mask.sum(1, keepdim=True).clamp(min=1)
+            
+        label_tokens = [i for i in range(len(label_idx_dic))]
+        for label in label_idx_dic.keys():
+            token = '__'+ label+ '__'
+            tokenizer.add_tokens([token.lower()])
+            
+        if args.label_cpt:
+            def _loop(a):
+                if label_name_parent_dic[a] != 'root':
+                    return [a,] + _loop(label_name_parent_dic[a])
+                else:
+                    return [a]
+            label_level_dic = {} #每个 labal 的level, root 0
+            for i in label_idx_dic.keys():
+                label_level_dic[i] = len(_loop(i))
+            
+            
+            max_labels_in_batch = 500 
+            trained_label_emb = torch.zeros_like(init_label_emb)
+            
+            label_name_batchs = get_labels_batch(label_name_child_hiera_set)
+            
+            trained_label_emb = torch.zeros_like(init_label_emb)
+        
+            batch_idx = 1
+            for batch_labels_keys in label_name_batchs:
+                batch_original_indices = [label_idx_dic[name] for name in batch_labels_keys]
+                logging.info(f"start training label name batch idx:{batch_idx}")
+                if not batch_labels_keys:
+                    continue
+                label_name_to_batch_idx = {name: j for j, name in enumerate(batch_labels_keys)}
+                
+                batch_init_label_emb = init_label_emb[batch_original_indices]
+                batch_attention_mask = torch.zeros((len(batch_labels_keys) + 2, len(batch_labels_keys) + 2))
+                batch_label_child_set = defaultdict(set)
+                batch_label_parent_dic = {}
+                
+                def _label_map_f_batch(label_name):
+                    if label_name == 'root': return -1
+                    return label_name_to_batch_idx.get(label_name, -999)
+                
+                for parent_label, child_labels in label_name_child_hiera_set.items():
+                    for child_label in list(child_labels):
+                        if parent_label in label_name_to_batch_idx and child_label in label_name_to_batch_idx:
+                            parent_batch_idx = _label_map_f_batch(parent_label)
+                            child_batch_idx = _label_map_f_batch(child_label)
+                            batch_attention_mask[parent_batch_idx + 1][child_batch_idx + 1] = 1
+                            batch_label_child_set[parent_batch_idx].add(child_batch_idx)
+                            batch_label_parent_dic[child_batch_idx] = parent_batch_idx
+                            if args.label_cpt_use_bce:
+                                batch_attention_mask[child_batch_idx + 1][parent_batch_idx + 1] = 1
+                
+                batch_label_tokens = ['__'+name+'__' for name in batch_labels_keys]
+                batch_input_ids_str = ' '.join(batch_label_tokens)
+                encoded_tokens = tokenizer.encode(batch_input_ids_str, add_special_tokens=False)
+                batch_input_ids = torch.LongTensor([tokenizer.cls_token_id] + encoded_tokens + [tokenizer.sep_token_id])
+                
+                assert len(batch_input_ids) == len(batch_labels_keys) + 2
+                batch_label_classes = [label_level_dic[name] for name in batch_labels_keys]
+                max_level_in_batch = max(batch_label_classes) if batch_label_classes else 0
+                batch_position_ids = torch.LongTensor([0] + batch_label_classes + [max_level_in_batch + 1])
+                
+                updated_batch_emb = train_batch_labels(
+                    args, tokenizer, batch_input_ids, batch_attention_mask,
+                    batch_position_ids, batch_init_label_emb, 
+                    batch_label_child_set, batch_label_parent_dic
+                )
+                trained_label_emb[batch_original_indices] = updated_batch_emb
+                batch_idx += 1
+                ##TODO debug
+                if batch_idx > 2:
+                    break
+        
+            init_label_emb = trained_label_emb.detach().cpu()
+            torch.save(init_label_emb, 'label_name_emb_after_train.pt')
+
+        
+        model.bert.embeddings.word_embeddings.weight.data = torch.cat([model.bert.embeddings.word_embeddings.weight.data, init_label_emb], dim=0)
+        model.bert.embeddings.word_embeddings.num_embeddings += len(label_tokens)
+        model.cls.predictions.bias.data =  torch.cat([model.cls.predictions.bias.data, torch.zeros(len(label_tokens))],
+                                                        dim=0)
+        vs = config.vocab_size
+        config.vocab_size = config.vocab_size + len(label_tokens)
+        if args.softmax_label_only:
+            model.label_start_index = label_tokens_start_index
+    else:
+        vs = config.vocab_size
+
+    if args.soft_label:
+        model.soft_label = True
+        model.mask_token_id = tokenizer.mask_token_id
+        model.sep_token_id = tokenizer.sep_token_id
+        model.vs = vs
+
+    return model, tokenizer, vs
 
 def prepare_for_training(args, model, checkpoint_state_dict, amp):
     no_decay = ['bias', 'LayerNorm.weight']
@@ -157,7 +435,7 @@ def prepare_for_training(args, model, checkpoint_state_dict, amp):
                             'num_source_tokens': torch.zeros(size=(2,), device=args.device, dtype=torch.long),
                             'num_target_tokens': torch.zeros(size=(2,), device=args.device, dtype=torch.long)}
             loss = model(**random_input)
-            print("Loss = %f" % loss.cpu().item())
+            logging.info("Loss = %f" % loss.cpu().item())
             with amp.scale_loss(loss, optimizer) as scaled_loss:
                 scaled_loss.backward()
             optimizer.step()
@@ -230,11 +508,11 @@ def train(args, training_features, model, tokenizer):
     )
 
 
-    logger.info("Check dataset:")
+    logging.info("Check dataset:")
     for i in range(5):
         source_ids, target_ids = train_dataset.__getitem__(i)[:2]
-        logger.info("Instance-%d" % i)
-        logger.info("Source tokens = %s" % " ".join(tokenizer.convert_ids_to_tokens(source_ids)))
+        logging.info("Instance-%d" % i)
+        logging.info("Source tokens = %s" % " ".join(tokenizer.convert_ids_to_tokens(source_ids)))
         if args.soft_label:
             real_target_ids = []
             if type(target_ids) is list:
@@ -242,24 +520,24 @@ def train(args, training_features, model, tokenizer):
             for i in range(target_ids.shape[0]):
                 real_target_ids.append(torch.arange(target_ids.shape[-1])[target_ids[i].bool()].tolist())
             for rti in real_target_ids:
-                logger.info("Target tokens = %s" % " ".join(tokenizer.convert_ids_to_tokens(rti)))
+                logging.info("Target tokens = %s" % " ".join(tokenizer.convert_ids_to_tokens(rti)))
         else:
-            logger.info("Target tokens = %s" % " ".join(tokenizer.convert_ids_to_tokens(target_ids)))
+            logging.info("Target tokens = %s" % " ".join(tokenizer.convert_ids_to_tokens(target_ids)))
 
-    logger.info("Mode = %s" % str(model))
+    logging.info("Mode = %s" % str(model))
 
     # Train!
-    logger.info("  ***** Running training *****  *")
-    logger.info("  Num examples = %d", len(training_features))
-    logger.info("  Num Epochs = %.2f", len(train_dataset) / len(training_features))
-    logger.info("  Instantaneous batch size per GPU = %d", args.per_gpu_train_batch_size)
-    logger.info("  Batch size per node = %d", per_node_train_batch_size)
-    logger.info("  Total train batch size (w. parallel, distributed & accumulation) = %d", train_batch_size)
-    logger.info("  Gradient Accumulation steps = %d", args.gradient_accumulation_steps)
-    logger.info("  Total optimization steps = %d", args.num_training_steps)
+    logging.info("  ***** Running training *****  *")
+    logging.info("  Num examples = %d", len(training_features))
+    logging.info("  Num Epochs = %.2f", len(train_dataset) / len(training_features))
+    logging.info("  Instantaneous batch size per GPU = %d", args.per_gpu_train_batch_size)
+    logging.info("  Batch size per node = %d", per_node_train_batch_size)
+    logging.info("  Total train batch size (w. parallel, distributed & accumulation) = %d", train_batch_size)
+    logging.info("  Gradient Accumulation steps = %d", args.gradient_accumulation_steps)
+    logging.info("  Total optimization steps = %d", args.num_training_steps)
 
     if args.num_training_steps <= global_step:
-        logger.info("Training is done. Please use a new dir or clean this dir!")
+        logging.info("Training is done. Please use a new dir or clean this dir!")
     else:
         # The training features are shuffled
         train_sampler = SequentialSampler(train_dataset) \
@@ -320,7 +598,7 @@ def train(args, training_features, model, tokenizer):
                                    "train/global_step": step})
             else:
                 if (step + 1) % 50 == 0:
-                    print('train/loss', loss.item())
+                    logging.info('train/loss', loss.item())
 
             if args.gradient_accumulation_steps > 1:
                 loss = loss / args.gradient_accumulation_steps
@@ -345,8 +623,8 @@ def train(args, training_features, model, tokenizer):
                 global_step += 1
 
                 if args.local_rank in [-1, 0] and args.logging_steps > 0 and global_step % args.logging_steps == 0:
-                    logger.info("")
-                    logger.info(" Step [%d ~ %d]: %.2f", global_step - args.logging_steps, global_step, logging_loss)
+                    logging.info("")
+                    logging.info(" Step [%d ~ %d]: %.2f", global_step - args.logging_steps, global_step, logging_loss)
                     logging_loss = 0.0
 
                 if args.local_rank in [-1, 0] and args.save_steps > 0 and \
@@ -364,7 +642,7 @@ def train(args, training_features, model, tokenizer):
                     if args.fp16:
                         optim_to_save["amp"] = amp.state_dict()
                     torch.save(optim_to_save, os.path.join(save_path, utils.OPTIM_NAME))
-                    logger.info("Saving model checkpoint %d into %s", global_step, save_path)
+                    logging.info("Saving model checkpoint %d into %s", global_step, save_path)
 
                     from test import main
 
@@ -428,8 +706,8 @@ def train(args, training_features, model, tokenizer):
                             shutil.rmtree(save_path)
                         except:
                             pass
-                    print('best micro', best_micro_f1_path, best_micro_f1)
-                    print('best macro', best_macro_f1_path, best_macro_f1)
+                    logging.info('best micro', best_micro_f1_path, best_micro_f1)
+                    logging.info('best macro', best_macro_f1_path, best_macro_f1)
 
     if args.local_rank in [-1, 0] and tb_writer:
         tb_writer.close()
@@ -563,6 +841,11 @@ def get_args():
     parser.add_argument('--only_test_path', type=str, default=None)
 
     parser.add_argument('--rcv1_expand', type=str, default=None)
+    
+    parser.add_argument('--ztf_path', type=str, default='/root/autodl-tmp/HBGL/data/ztfData/ztf/ztf_handle.txt')
+    parser.add_argument('--train_data_path', type=str, default='/root/autodl-tmp/HBGL/data/ztfData/train/train_data_clear.jsonl')
+    
+    
     parser.add_argument
     args = parser.parse_args()
     return args
@@ -573,7 +856,7 @@ def prepare(args):
     if args.server_ip and args.server_port:
         # Distant debugging - see https://code.visualstudio.com/docs/python/debugging#_attach-to-a-local-script
         import ptvsd
-        print("Waiting for debugger attach")
+        logging.info("Waiting for debugger attach")
         ptvsd.enable_attach(address=(args.server_ip, args.server_port), redirect_output=True)
         ptvsd.wait_for_attach()
 
@@ -596,7 +879,7 @@ def prepare(args):
     logging.basicConfig(format='%(asctime)s - %(levelname)s - %(name)s -   %(message)s',
                         datefmt='%m/%d/%Y %H:%M:%S',
                         level=logging.INFO if args.local_rank in [-1, 0] else logging.WARN)
-    logger.warning("Process rank: %s, device: %s, n_gpu: %s, distributed training: %s, 16-bits training: %s",
+    logging.warning("Process rank: %s, device: %s, n_gpu: %s, distributed training: %s, 16-bits training: %s",
                    args.local_rank, device, args.n_gpu, bool(args.local_rank != -1), args.fp16)
 
     # Set seed
@@ -606,7 +889,7 @@ def prepare(args):
     if args.n_gpu > 0:
         torch.cuda.manual_seed_all(args.seed)
 
-    logger.info("Training/evaluation parameters %s", args)
+    logging.info("Training/evaluation parameters %s", args)
 
     # Before we do anything with models, we want to ensure that we get fp16 execution of torch.einsum if args.fp16 is set.
     # Otherwise it'll default to "promote" mode, and we'll get fp32 operations. Note that running `--fp16_opt_level="O2"` will
@@ -629,7 +912,7 @@ def get_model_and_tokenizer(args):
         fix_word_embedding=args.fix_word_embedding,
         max_position_embeddings=args.max_source_seq_length + args.max_target_seq_length)
 
-    logger.info("Model config for seq2seq: %s", str(config))
+    logging.info("Model config for seq2seq: %s", str(config))
 
     tokenizer = tokenizer_class.from_pretrained(
         args.model_name_or_path)
@@ -638,7 +921,7 @@ def get_model_and_tokenizer(args):
         BertForSequenceToSequenceWithPseudoMask if args.mask_way == 'v2' \
             else BertForSequenceToSequenceUniLMV1
 
-    logger.info("Construct model %s" % model_class.MODEL_NAME)
+    logging.info("Construct model %s" % model_class.MODEL_NAME)
 
     model = model_class.from_pretrained(
         args.model_name_or_path, config=config, model_type=args.model_type,
@@ -689,13 +972,13 @@ def get_model_and_tokenizer(args):
                 one_by_one_label_init_map = {}
                 for i in _label_dict:
                     one_by_one_label_init_map[i] = '/'.join(_loop(i)[::-1])
-                print(f'map {lk} to {one_by_one_label_init_map[lk]}')
+                logging.info(f'map {lk} to {one_by_one_label_init_map[lk]}')
                 label_name_tensors.append(tokenizer.encode(one_by_one_label_init_map[lk], add_special_tokens=False))
             elif args.nyt_only_last_label_init:
-                print(f'map {lk} to {lk.split("/")[-1]}')
+                logging.info(f'map {lk} to {lk.split("/")[-1]}')
                 label_name_tensors.append(tokenizer.encode(lk.split("/")[-1], add_special_tokens=False))
             elif args.rcv1_expand:
-                print(f'map {lk} to {rcv1_label_expand[lk]}')
+                logging.info(f'map {lk} to {rcv1_label_expand[lk]}')
                 label_name_tensors.append(tokenizer.encode(rcv1_label_expand[lk], add_special_tokens=False))
             else:
                 label_name_tensors.append(tokenizer.encode(lk, add_special_tokens=False))
@@ -856,7 +1139,9 @@ def main():
         torch.distributed.barrier()
         # Make sure only the first process in distributed training will download model & vocab
     # Load pretrained model and tokenizer
-    model, tokenizer, vs = get_model_and_tokenizer(args)
+    # train_label_name_embedding(args)
+    # return
+    model, tokenizer, vs = train_label_name_embedding(args)
 
     if args.local_rank == 0:
         torch.distributed.barrier()

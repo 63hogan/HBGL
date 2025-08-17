@@ -6,3 +6,5 @@ wandb/
 models/
 data/ztfData/
 HBGL.tar
+log.txt
+__pycache__/

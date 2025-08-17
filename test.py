@@ -21,9 +21,12 @@ from transformers.tokenization_bert import whitespace_tokenize
 import s2s_ft.s2s_loader as seq2seq_loader
 from s2s_ft.utils import load_and_cache_examples
 from transformers import BertTokenizer
+from data_tool import *
+
 
 TOKENIZER_CLASSES = {
     'bert': BertTokenizer,
+    'roberta': BertTokenizer,
 }
 
 
@@ -155,16 +158,28 @@ def main(flags=None):
         cache_dir=args.cache_dir if args.cache_dir else None)
 
     if args.add_vocab_file:
-        import pickle
-        with open(args.add_vocab_file, 'rb') as f:
-            label_map = pickle.load(f)
-        labels_key = list(label_map.keys())
-        # tokenizer.add_special_tokens({'additional_special_tokens': [label_map[label] for label in labels_key]})
-        tokenizer.add_tokens([label_map[label] for label in labels_key])
-        add_token_num = len(labels_key)
+        # import pickle
+        # with open(args.add_vocab_file, 'rb') as f:
+        #     label_map = pickle.load(f)
+        # labels_key = list(label_map.keys())
+        # # tokenizer.add_special_tokens({'additional_special_tokens': [label_map[label] for label in labels_key]})
+        # tokenizer.add_tokens([label_map[label] for label in labels_key])
+        # add_token_num = len(labels_key)
+        
+        ztf_map = read_key_value_file('/root/autodl-tmp/HBGL/data/ztfData/ztf/ztf_handle.txt')
+        label_name_set = get_uniq_train_cls_from_json('/root/autodl-tmp/HBGL/data/ztfData/train/train_data_clear.jsonl')
+        _, label_name_parent_dic = get_ztf_hierarchy_info(ztf_map)
+        label_name_child_hiera_set, _ = get_train_labels_hiera_info(label_name_set,ztf_map)
+        label_idx_dic = get_label_idx(label_name_child_hiera_set)
+        label_tokens = [i for i in range(len(label_idx_dic))]
+        for label in label_idx_dic.keys():
+            token = '__'+ label+ '__'
+            tokenizer.add_tokens([token.lower()])
+        add_token_num = len(label_idx_dic)
 
     if args.model_type == "roberta":
-        vocab = tokenizer.encoder
+        vocab = tokenizer.vocab
+        # vocab = tokenizer.encoder
     elif args.model_type == "xlm-roberta":
         vocab = {}
         for tk_id in range(len(tokenizer)):
@@ -342,9 +357,10 @@ def main(flags=None):
         def token_to_id(token):
             token = token.lower()
             try:
-                token = int(token.replace('[a_', '').replace(']', ''))
-                token = 0 if token >= len(label_map) else token
-                return token
+                token = int(token.replace('__', '').replace('__', ''))
+                if token in label_idx_dic:
+                    return label_idx_dic[token]
+                return 0
             except:
                 return 0
 
