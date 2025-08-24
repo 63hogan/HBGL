@@ -8,3 +8,11 @@ data/ztfData/
 HBGL.tar
 log.txt
 __pycache__/
+
+models/
+
+tensorboard_log/
+
+data/
+hogan_ztf/tensor_log/*
+*.log

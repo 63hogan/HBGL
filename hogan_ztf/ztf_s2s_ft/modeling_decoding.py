@@ -15,6 +15,8 @@ import tempfile
 import shutil
 import numpy as np
 
+from functools import partial
+
 import torch
 from torch import nn
 from torch.nn import CrossEntropyLoss, MSELoss
@@ -283,12 +285,8 @@ class BertEmbeddings(nn.Module):
         self.LayerNorm = BertLayerNorm(config.hidden_size, eps=1e-5)
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
 
-    def forward(self, input_ids, token_type_ids=None, position_ids=None, task_idx=None, inputs_embeds=None):
-        if input_ids is not None:
-            seq_length = input_ids.size()
-        else:
-            seq_length = inputs_embeds.size()[:-1]
-
+    def forward(self, input_ids, token_type_ids=None, position_ids=None, task_idx=None):
+        seq_length = input_ids.size(1)
         if position_ids is None:
             position_ids = torch.arange(
                 seq_length, dtype=torch.long, device=input_ids.device)
@@ -296,11 +294,7 @@ class BertEmbeddings(nn.Module):
         if token_type_ids is None:
             token_type_ids = torch.zeros_like(input_ids)
 
-        if inputs_embeds is None:
-            words_embeddings = self.word_embeddings(input_ids)
-        else:
-            words_embeddings = inputs_embeds
-
+        words_embeddings = self.word_embeddings(input_ids)
         position_embeddings = self.position_embeddings(position_ids)
 
         if self.num_pos_emb > 1:
@@ -911,8 +905,8 @@ class BertModel(PreTrainedBertModel):
         # positions we want to attend and -10000.0 for masked positions.
         # Since we are adding it to the raw scores before the softmax, this is
         # effectively the same as removing these entirely.
-        #extended_attention_mask = extended_attention_mask.to(
-            #dtype=next(self.parameters()).dtype)  # fp16 compatibility
+        extended_attention_mask = extended_attention_mask.to(
+            dtype=next(self.parameters()).dtype)  # fp16 compatibility
         extended_attention_mask = (1.0 - extended_attention_mask) * -10000.0
         return extended_attention_mask
 
@@ -944,13 +938,12 @@ class BertModelIncr(BertModel):
             self.rel_pos_bias = None
 
     def forward(self, input_ids, token_type_ids, position_ids, attention_mask, output_all_encoded_layers=True,
-                prev_embedding=None, prev_encoded_layers=None, mask_qkv=None, task_idx=None, rel_pos=None,
-                inputs_embeds=None):
+                prev_embedding=None, prev_encoded_layers=None, mask_qkv=None, task_idx=None, rel_pos=None):
         extended_attention_mask = self.get_extended_attention_mask(
             input_ids, token_type_ids, attention_mask)
 
         embedding_output = self.embeddings(
-            input_ids, token_type_ids, position_ids, task_idx=task_idx, inputs_embeds=inputs_embeds)
+            input_ids, token_type_ids, position_ids, task_idx=task_idx)
 
         if self.rel_pos_bias is not None:
             # print("Rel pos size = %s" % str(rel_pos.size()))
@@ -1092,6 +1085,33 @@ def relative_position_bucket(relative_position, bidirectional=True, num_buckets=
     return ret
 
 
+def get_div_func():
+    # a crude code fix floor div for multiple torch version
+    # https://github.com/microsoft/unilm/issues/297
+    # Thanks github user @guijuzhejiang, @piskunow and @zengyan-97
+    x = torch.ones(size=(1,), dtype=torch.long) * 11
+    try:
+        # for pytorch 1.8+
+        div_func = partial(torch.div, rounding_mode='floor')
+        y = div_func(x, 4)
+        return div_func
+    except:
+        pass
+    try:
+        # for pytorch 1.6 & 1.7
+        div_func = torch.floor_divide
+        y = div_func(x, 4)
+        return div_func
+    except:
+        pass
+
+    div_func = torch.div
+    y = div_func(x, 4)
+    if y.dtype != torch.long:
+        raise NotImplementedError("Can not found right floor div function !")
+    return div_func
+
+
 class BertForSeq2SeqDecoder(PreTrainedBertModel):
     """refer to BertForPreTraining"""
 
@@ -1120,11 +1140,7 @@ class BertForSeq2SeqDecoder(PreTrainedBertModel):
         self.mode = mode
         self.pos_shift = pos_shift
 
-        self.label_start_index = -1
-        self.ab_bound_token_id = -1
-        self.soft_label = False
-        self.hier_labels = None
-        self.soft_label_hier_real = False
+        self.div_func = get_div_func()
 
     def forward(self, input_ids, token_type_ids, position_ids, attention_mask, task_idx=None, mask_qkv=None):
         if self.search_beam_size > 1:
@@ -1154,38 +1170,18 @@ class BertForSeq2SeqDecoder(PreTrainedBertModel):
             rel_pos = None
 
         while next_pos < output_length:
-            if self.soft_label and curr_ids is None:
-                # set curr_ids to None in two more loops
-                curr_length = pred_embeds.size()[1]
-                if self.pos_shift:
-                    if next_pos == input_length:
-                        x_input_ids = torch.cat((curr_ids, sep_ids), dim=1)
-                        x_input_embeds = torch.cat((pred_embeds,
-                                                    self.bert.embeddings.word_embeddings(sep_ids)), dim=1)
-                        start_pos = 0
-                    else:
-                        x_input_ids = curr_ids
-                        x_input_embeds = pred_embeds
-                        start_pos = next_pos
-                else:
-                    start_pos = next_pos - curr_length
-                    x_input_embeds = torch.cat((pred_embeds,
-                                                self.bert.embeddings.word_embeddings(mask_ids)), dim=1)
-                x_input_ids = None
-            else:
-                curr_length = list(curr_ids.size())[1]
-                if self.pos_shift:
-                    if next_pos == input_length:
-                        x_input_ids = torch.cat((curr_ids, sep_ids), dim=1)
-                        start_pos = 0
-                    else:
-                        x_input_ids = curr_ids
-                        start_pos = next_pos
-                else:
-                    start_pos = next_pos - curr_length
-                    x_input_ids = torch.cat((curr_ids, mask_ids), dim=1)
-                x_input_embeds = None
+            curr_length = list(curr_ids.size())[1]
 
+            if self.pos_shift:
+                if next_pos == input_length:
+                    x_input_ids = torch.cat((curr_ids, sep_ids), dim=1)
+                    start_pos = 0
+                else:
+                    x_input_ids = curr_ids
+                    start_pos = next_pos
+            else:
+                start_pos = next_pos - curr_length
+                x_input_ids = torch.cat((curr_ids, mask_ids), dim=1)
 
             curr_token_type_ids = token_type_ids[:, start_pos:next_pos + 1]
             curr_attention_mask = attention_mask[:,
@@ -1197,107 +1193,16 @@ class BertForSeq2SeqDecoder(PreTrainedBertModel):
             else:
                 cur_rel_pos = None
 
-            if self.soft_label and x_input_embeds is not None:
-                new_embedding, new_encoded_layers, _ = \
-                    self.bert(None, curr_token_type_ids, curr_position_ids, curr_attention_mask,
-                            output_all_encoded_layers=True, prev_embedding=prev_embedding,
-                              prev_encoded_layers=prev_encoded_layers, mask_qkv=mask_qkv, rel_pos=cur_rel_pos,
-                              inputs_embeds=x_input_embeds, )
-            else:
-                new_embedding, new_encoded_layers, _ = \
-                    self.bert(x_input_ids, curr_token_type_ids, curr_position_ids, curr_attention_mask,
-                            output_all_encoded_layers=True, prev_embedding=prev_embedding,
-                            prev_encoded_layers=prev_encoded_layers, mask_qkv=mask_qkv, rel_pos=cur_rel_pos)
+            new_embedding, new_encoded_layers, _ = \
+                self.bert(x_input_ids, curr_token_type_ids, curr_position_ids, curr_attention_mask,
+                          output_all_encoded_layers=True, prev_embedding=prev_embedding,
+                          prev_encoded_layers=prev_encoded_layers, mask_qkv=mask_qkv, rel_pos=cur_rel_pos)
 
             last_hidden = new_encoded_layers[-1][:, -1:, :]
-            if self.soft_label:
-                if self.soft_label_hier_real:
-                    curr_hier = len(output_ids)
-                    hl = self.hier_labels[curr_hier]
-                    prediction_scores, _ = self.cls(last_hidden, None, task_idx=task_idx)
-
-                    prediction_scores = torch.cat([prediction_scores[:, :, self.eos_id].unsqueeze(-1),
-                                                prediction_scores[:, :, hl]], dim=-1)
-
-                    prediction_scores = torch.sigmoid(prediction_scores) > 0.5
-
-                    _pred_ids = []
-                    for i in range(prediction_scores.shape[0]):
-                        pred_ids = torch.arange(prediction_scores.shape[-1])[prediction_scores[i, -1]]
-                        sep_mask = pred_ids == 0
-                        pred_ids[sep_mask] = self.eos_id
-                        pred_ids[~sep_mask] = torch.arange(hl.shape[-1])[hl][pred_ids[~sep_mask] - 1]
-                        _pred_ids.append(pred_ids)
-                    pred_ids = _pred_ids
-                    output_ids.append(pred_ids)
-
-                    pred_embeds =  prediction_scores.float() @ torch.cat(
-                        [self.bert.embeddings.word_embeddings.weight.data[self.eos_id].unsqueeze(0),
-                        self.bert.embeddings.word_embeddings.weight.data[hl]], dim=0)
-                    max_ids = None
-                else:
-                    lsi = self.label_start_index
-                    prediction_scores, _ = self.cls(last_hidden, None, task_idx=task_idx)
-
-                    prediction_scores = torch.cat([prediction_scores[:, :, self.eos_id].unsqueeze(-1),
-                                                prediction_scores[:, :, lsi:]], dim=-1)
-
-                    prediction_scores = torch.sigmoid(prediction_scores) > 0.5
-
-                    _pred_ids = []
-                    for i in range(prediction_scores.shape[0]):
-                        # pred_ids = torch.arange(prediction_scores.shape[-1])[prediction_scores[i, -1]]
-                        pred_ids = torch.arange(prediction_scores.shape[-1], device=prediction_scores.device)[prediction_scores[i, -1]]
-                        sep_mask = pred_ids == 0
-                        pred_ids[sep_mask] = self.eos_id
-                        pred_ids[~sep_mask] += lsi - 1
-                        _pred_ids.append(pred_ids)
-                    pred_ids = _pred_ids
-                    output_ids.append(pred_ids)
-
-                    pred_embeds =  prediction_scores.float() @ torch.cat(
-                        [self.bert.embeddings.word_embeddings.weight.data[self.eos_id].unsqueeze(0),
-                        self.bert.embeddings.word_embeddings.weight.data[lsi:]], dim=0)
-                    max_ids = None
-            elif self.label_start_index > 0:
-                lsi = self.label_start_index
-                prediction_scores, _ = self.cls(
-                    last_hidden, None, task_idx=task_idx)
-
-                prediction_scores = torch.cat([prediction_scores[:, :, self.eos_id].unsqueeze(-1),
-                                               prediction_scores[:, :, lsi:]], dim=-1)
-
-                _, max_ids = torch.max(prediction_scores, dim=-1)
-                sep_mask = max_ids == 0
-                max_ids[sep_mask] = self.eos_id
-                max_ids[~sep_mask] += lsi - 1
-                output_ids.append(max_ids)
-            elif self.ab_bound_token_id > 0:
-                if len(output_ids) > 0:
-                    last_output_ids = output_ids[-1]
-                    hidden_states = self.cls.predictions.transform(last_hidden)
-                    prediction_scores = F.linear(hidden_states, weight=self.cls.predictions.decoder.weight, bias=self.cls.predictions.bias)
-                    b_token_embs = self.cls.predictions.decoder.weight[self.ab_bound_token_id:, ]
-
-                    for i, label_id in enumerate(last_output_ids.view(-1).tolist()):
-                        if label_id < self.ab_bound_token_id:
-                            new_b_token_embs = b_token_embs + self.cls.predictions.decoder.weight[label_id]
-                            new_b_scores = F.linear(hidden_states[i], weight=new_b_token_embs,
-                                                    bias=self.cls.predictions.bias[self.ab_bound_token_id:])
-                            prediction_scores[i, :,   self.ab_bound_token_id:] = new_b_scores
-
-                    _, max_ids = torch.max(prediction_scores, dim=-1)
-                    output_ids.append(max_ids)
-                else:
-                    prediction_scores, _ = self.cls(
-                        last_hidden, None, task_idx=task_idx)
-                    _, max_ids = torch.max(prediction_scores, dim=-1)
-                    output_ids.append(max_ids)
-            else:
-                prediction_scores, _ = self.cls(
-                    last_hidden, None, task_idx=task_idx)
-                _, max_ids = torch.max(prediction_scores, dim=-1)
-                output_ids.append(max_ids)
+            prediction_scores, _ = self.cls(
+                last_hidden, None, task_idx=task_idx)
+            _, max_ids = torch.max(prediction_scores, dim=-1)
+            output_ids.append(max_ids)
 
             if self.pos_shift:
                 if prev_embedding is None:
@@ -1325,30 +1230,7 @@ class BertForSeq2SeqDecoder(PreTrainedBertModel):
             curr_ids = max_ids
             next_pos += 1
 
-        if self.soft_label:
-            _output_ids = [[] for _ in output_ids[0]]
-            max_l = 0
-            for i, oi in enumerate(_output_ids):
-                _output_ids[i] = torch.cat([j[i] for j in output_ids], dim=0)
-                # t = False
-                # for j in _output_ids[i].tolist():
-                #     try:
-                #         if t: assert j <= 102
-                #     except:
-                #         print(j)
-                #     if j == 102: t = True
-                index = 10000
-                for index, d in enumerate(_output_ids[i].tolist()):
-                    if d == 102: break
-                _output_ids[i] = sorted(list(set(_output_ids[i].tolist()[:index])), reverse=True)
-                max_l = max(len(_output_ids[i]), max_l)
-
-            for i, oi in enumerate(_output_ids):
-                _output_ids[i] = torch.LongTensor(oi + [0] * (max_l - len(oi))).unsqueeze(0)
-            output_ids = _output_ids
-            return torch.cat(output_ids, dim=0)
-        else:
-            return torch.cat(output_ids, dim=1)
+        return torch.cat(output_ids, dim=1)
 
     def beam_search(self, input_ids, token_type_ids, position_ids, attention_mask, task_idx=None, mask_qkv=None):
         input_shape = list(input_ids.size())
@@ -1433,8 +1315,8 @@ class BertForSeq2SeqDecoder(PreTrainedBertModel):
                 kk_scores += last_eos * (-10000.0) + last_seq_scores
                 kk_scores = torch.reshape(kk_scores, [batch_size, K * K])
                 k_scores, k_ids = torch.topk(kk_scores, k=K)
-                back_ptrs = torch.div(k_ids, K)
-                back_ptrs = back_ptrs.long()
+                # back_ptrs = torch.div(k_ids, K)
+                back_ptrs = self.div_func(k_ids, K)
                 kk_ids = torch.reshape(kk_ids, [batch_size, K * K])
                 k_ids = torch.gather(kk_ids, 1, k_ids)
             step_back_ptrs.append(back_ptrs)

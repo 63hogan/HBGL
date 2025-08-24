@@ -188,7 +188,8 @@ def train_batch_labels(args, tokenizer, input_ids, attention_mask,  position_ids
             labels[masked_indices[:, 0], masked_indices[:, 1]] = masked_indices[:, 1] - 1
         
         inputs_embeds[mask_tokens] = model.bert.embeddings.word_embeddings.weight[tokenizer.mask_token_id]
-        ##TODO set  target type id 
+        ##TODO set  target type id
+        
         outputs = model.bert(
             None,
             attention_mask=attention_mask,
@@ -290,9 +291,9 @@ def train_label_name_embedding(args):
             token = '__'+ label+ '__'
             tokenizer.add_tokens([token.lower()])
 
-        if args.load_label_embedding_cache and os.path.exists('label_name_emb_after_train.pt'):
+        if args.load_label_embedding_cache and os.path.exists('/root/autodl-tmp/HBGL/label_name_emb_before_train.pt'):
             logging.info("直接从本地加载 label_name_emb_after_train.pt")
-            init_label_emb = torch.load('label_name_emb_after_train.pt')
+            init_label_emb = torch.load('/root/autodl-tmp/HBGL/label_name_emb_after_train.pt')
         else:
                             
             if args.label_cpt:
@@ -467,7 +468,7 @@ def prepare_for_training(args, model, checkpoint_state_dict, amp):
 def train(args, training_features, model, tokenizer):
     """ Train the model """
     
-    tensorboard_logdir = f"/root/autodl-tmp/HBGL/tensorboard_log/my_experiment_{int(time.time())}"
+    tensorboard_logdir = f"/root/autodl-tmp/HBGL/hogan_ztf/tensor_log/my_experiment_{int(time.time())}"
     writer = SummaryWriter(tensorboard_logdir)
 
     logging.info(f"TensorBoard 日志将保存在: {tensorboard_logdir}")
@@ -558,9 +559,7 @@ def train(args, training_features, model, tokenizer):
         model.zero_grad()
 
         tr_loss, logging_loss = 0.0, 0.0
-        
         for step, batch in enumerate(train_iterator):
-            logging.info("start training step: %d, global_step: %d", step, global_step)
             if global_step > args.num_training_steps:
                 break
             batch = tuple(t.to(args.device) for t in batch)
@@ -587,8 +586,8 @@ def train(args, training_features, model, tokenizer):
             train_iterator.set_description('Iter (loss=%5.3f) lr=%9.7f' % (loss.item(), scheduler.get_lr()[0]))
             logging.info('Iter (loss=%5.3f) lr=%9.7f' % (loss.item(), scheduler.get_lr()[0]))
             if True:
-                writer.add_scalar('train/loss', loss.item(), global_step)
-                writer.add_scalar('train/learning_rate', scheduler.get_lr()[0],global_step)
+                writer.add_scalar('train/loss', loss.item(), step)
+                writer.add_scalar('train/learning_rate', scheduler.get_lr()[0],step)
                 
                 if (global_step + 1) % 50 == 0:
                     logging.info('global_step:%d (loss=%5.3f) lr=%9.7f' % (global_step, loss.item(), scheduler.get_lr()[0]))
@@ -1092,46 +1091,18 @@ def main():
         else:
             args.cached_train_features_file = os.path.join(args.output_dir, "cached_features_for_training_lmdb")
 
-    if args.soft_label:
-        args.cached_train_features_file += 'soft_label'
-        # args.valid_file = args.valid_file.replace('generated', 'generated_tl')
-        #
-        if args.soft_label_hier_real:
-            hier_labels = None
-            for line in open(args.train_file):
-                if hier_labels:
-                    for i, l in enumerate(json.loads(line)['tgt']):
-                        hier_labels[i] |=  set(l)
-                else:
-                    hier_labels = [set(i) for i in json.loads(line)['tgt']]
-            hier_labels = [tokenizer.convert_tokens_to_ids(list([j.lower() for j in i])) for i in hier_labels]
-
-            def to_multi_hot(label):
-                _label = torch.zeros(model.config.vocab_size)
-                for i in label:
-                    _label[i] = 1
-                return _label.bool()
-
-            model.hier_labels = [to_multi_hot(i) for i in hier_labels]
-            model.soft_label_hier_real = args.soft_label_hier_real
-
 
     num_lines = sum(1 for line in open(args.train_file))
     training_features = utils.load_and_cache_examples(
         example_file=args.train_file, tokenizer=tokenizer, local_rank=args.local_rank,
         cached_features_file=args.cached_train_features_file, shuffle=True,
         lmdb_cache=args.lmdb_cache, lmdb_dtype=args.lmdb_dtype,
-        soft_label=args.soft_label,
     )
 
     if args.add_vocab_file:
         for i in training_features:
             for j in i.target_ids:
-                if args.soft_label:
-                    for ji in j:
-                        assert ji >= vs
-                else:
-                    j >= vs
+                assert j >= vs
 
     save_path = train(args, training_features, model, tokenizer)
     if args.test_file:

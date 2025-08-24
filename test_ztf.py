@@ -16,6 +16,9 @@ import torch
 import random
 import pickle
 
+from data_tool import *
+
+
 from s2s_ft.modeling_decoding import BertForSeq2SeqDecoder, BertConfig
 from transformers.tokenization_bert import whitespace_tokenize
 import s2s_ft.s2s_loader as seq2seq_loader
@@ -32,10 +35,16 @@ class WhitespaceTokenizer(object):
         return whitespace_tokenize(text)
 
 
-logging.basicConfig(format='%(asctime)s - %(levelname)s - %(name)s -   %(message)s',
-                    datefmt='%m/%d/%Y %H:%M:%S',
-                    level=logging.INFO)
-logger = logging.getLogger(__name__)
+FORMAT = '%(asctime)s[%(name)s.%(funcName)s]%(levelname)s: %(message)s'
+
+
+# 使用 basicConfig 应用格式
+logging.basicConfig(level=logging.INFO, format=FORMAT)
+# 配置 logging
+logging.basicConfig(
+    level=logging.INFO,  # 设置最低记录级别为 DEBUG，所有级别的日志都会显示
+    format='%(asctime)s - %(levelname)s - [%(module)s:%(lineno)d] - %(message)s' # 设置日志格式
+)
 
 
 def detokenize(tk_list):
@@ -120,12 +129,16 @@ def main(flags=None):
     parser.add_argument('--softmax_label_only', action='store_true')
     parser.add_argument('--soft_label', action='store_true')
     parser.add_argument('--soft_label_hier_real_with_train_file', default=None, type=str)
+    parser.add_argument('--ztf_path', type=str, default=None)
+    parser.add_argument('--train_data_path', type=str, default=None)
 
     if flags:
         print(flags)
         args = parser.parse_args(flags)
     else:
         args = parser.parse_args()
+    
+
 
 
     if args.max_tgt_length >= args.max_seq_length - 2:
@@ -143,7 +156,7 @@ def main(flags=None):
             torch.cuda.manual_seed_all(args.seed)
     else:
         random_seed = random.randint(0, 10000)
-        logger.info("Set random seed as: {}".format(random_seed))
+        logging.info("Set random seed as: {}".format(random_seed))
         random.seed(random_seed)
         np.random.seed(random_seed)
         torch.manual_seed(random_seed)
@@ -155,13 +168,23 @@ def main(flags=None):
         cache_dir=args.cache_dir if args.cache_dir else None)
 
     if args.add_vocab_file:
-        import pickle
-        with open(args.add_vocab_file, 'rb') as f:
-            label_map = pickle.load(f)
-        labels_key = list(label_map.keys())
-        # tokenizer.add_special_tokens({'additional_special_tokens': [label_map[label] for label in labels_key]})
-        tokenizer.add_tokens([label_map[label] for label in labels_key])
-        add_token_num = len(labels_key)
+        # import pickle
+        # with open(args.add_vocab_file, 'rb') as f:
+        #     label_map = pickle.load(f)
+        # labels_key = list(label_map.keys())
+        # # tokenizer.add_special_tokens({'additional_special_tokens': [label_map[label] for label in labels_key]})
+        # tokenizer.add_tokens([label_map[label] for label in labels_key])
+        # add_token_num = len(labels_key)
+
+        ztf_map = read_key_value_file(args.ztf_path)
+        label_name_set = get_uniq_train_cls_from_json(args.train_data_path)
+        label_name_child_hiera_set, _ = get_train_labels_hiera_info(label_name_set,ztf_map)
+        label_idx_dic = get_label_idx(label_name_child_hiera_set)
+        for label in sorted(label_idx_dic.keys()):
+            token = '__'+ label+ '__'
+            tokenizer.add_tokens([token.lower()])
+        add_token_num = len(label_idx_dic)
+        
 
     if args.model_type == "roberta":
         vocab = tokenizer.encoder
@@ -195,10 +218,10 @@ def main(flags=None):
         if not os.path.isdir(model_recover_path):
             continue
 
-        logger.info("***** Recover model: %s *****", model_recover_path)
+        logging.info("***** Recover model: %s *****", model_recover_path)
 
         config_file = args.config_path if args.config_path else os.path.join(model_recover_path, "config.json")
-        logger.info("Read decoding config from: %s" % config_file)
+        logging.info("Read decoding config from: %s" % config_file)
         config = BertConfig.from_json_file(config_file)
 
         bi_uni_pipeline = []
@@ -273,7 +296,7 @@ def main(flags=None):
         for line in to_pred:
             input_lines.append(tokenizer.convert_ids_to_tokens(line.source_ids)[:max_src_length])
         if args.subset > 0:
-            logger.info("Decoding subset: %d", args.subset)
+            logging.info("Decoding subset: %d", args.subset)
             input_lines = input_lines[:args.subset]
 
         input_lines = sorted(list(enumerate(input_lines)),
@@ -325,7 +348,7 @@ def main(flags=None):
                             output_sequence = " [X_SEP] ".join(output_sequence.split('\n'))
                         output_lines[buf_id[i]] = output_sequence
                         if first_batch or batch_count % 50 == 0:
-                            logger.info("{} = {}".format(buf_id[i], output_sequence))
+                            logging.info("{} = {}".format(buf_id[i], output_sequence))
                 pbar.update(1)
                 first_batch = False
         if args.output_file:
@@ -337,40 +360,40 @@ def main(flags=None):
                 fout.write(l)
                 fout.write("\n")
 
-        import pickle
-        from eval import evaluate
-        def token_to_id(token):
-            token = token.lower()
-            try:
-                token = int(token.replace('[a_', '').replace(']', ''))
-                token = 0 if token >= len(label_map) else token
-                return token
-            except:
-                return 0
+        # import pickle
+        # from eval import evaluate
+        # def token_to_id(token):
+        #     token = token.lower()
+        #     try:
+        #         token = int(token.replace('[a_', '').replace(']', ''))
+        #         token = 0 if token >= len(label_map) else token
+        #         return token
+        #     except:
+        #         return 0
 
-        if args.model_type == 'roberta':
-            def roberta_token_to_id(token):
-                token = token.replace("<s>", '').replace('[A_', ' ').replace(']', ' ').split(' ')
-                token = [int(i) for i in token if i != '']
-                return token
-            predict_labels = [roberta_token_to_id(i) for i in output_lines]
-        else:
-            predict_labels = [i.replace("\n", '').split(' ') for i in output_lines]
-            predict_labels = [list(set([token_to_id(j) for j  in i])) for i in predict_labels]
-        with open(args.input_file) as f:
-            gd_labels = [json.loads(i)['tgt'] for i in f]
-            gd_labels = [[token_to_id(j) for j  in i.split(' ')] for i in gd_labels]
+        # if args.model_type == 'roberta':
+        #     def roberta_token_to_id(token):
+        #         token = token.replace("<s>", '').replace('[A_', ' ').replace(']', ' ').split(' ')
+        #         token = [int(i) for i in token if i != '']
+        #         return token
+        #     predict_labels = [roberta_token_to_id(i) for i in output_lines]
+        # else:
+        #     predict_labels = [i.replace("\n", '').split(' ') for i in output_lines]
+        #     predict_labels = [list(set([token_to_id(j) for j  in i])) for i in predict_labels]
+        # with open(args.input_file) as f:
+        #     gd_labels = [json.loads(i)['tgt'] for i in f]
+        #     gd_labels = [[token_to_id(j) for j  in i.split(' ')] for i in gd_labels]
 
-        with open(args.add_vocab_file, 'rb') as f:
-            label_map = pickle.load(f)
-        id2label = {token_to_id(label_map[k]): k for k in label_map}
-        out = evaluate(predict_labels, gd_labels, id2label, as_sample=True)
-        del out['full']
-        print(out)
-        return out
+        # with open(args.add_vocab_file, 'rb') as f:
+        #     label_map = pickle.load(f)
+        # id2label = {token_to_id(label_map[k]): k for k in label_map}
+        # out = evaluate(predict_labels, gd_labels, id2label, as_sample=True)
+        # del out['full']
+        # print(out)
+        # return out
 
     if not found_checkpoint_flag:
-        logger.info("Not found the model checkpoint file!")
+        logging.info("Not found the model checkpoint file!")
 
 
 if __name__ == "__main__":

@@ -24,10 +24,24 @@ from transformers import \
     
 from s2s_ft import utils
 from s2s_ft.config import BertForSeq2SeqConfig
+from torch.utils.tensorboard import SummaryWriter
+import time
 
 LOGLEVEL = os.environ.get('LOGLEVEL', 'INFO').upper()
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=LOGLEVEL)
+
+
+FORMAT = '%(asctime)s[%(name)s.%(funcName)s]%(levelname)s: %(message)s'
+
+
+# 使用 basicConfig 应用格式
+logging.basicConfig(level=logging.INFO, format=FORMAT)
+# # 配置 logging
+# logging.basicConfig(
+#     level=logging.INFO,  # 设置最低记录级别为 DEBUG，所有级别的日志都会显示
+#     format='%(asctime)s - %(levelname)s - [%(module)s:%(lineno)d] - %(message)s' # 设置日志格式
+# )
 
 
 MODEL_CLASSES = {
@@ -185,6 +199,12 @@ def train(args, training_features, model, tokenizer):
     else:
         tb_writer = None
 
+    tensorboard_logdir = f"/root/autodl-tmp/HBGL/tensorboard_log/my_experiment_{int(time.time())}"
+    writer = SummaryWriter(tensorboard_logdir)
+    save_path = None
+
+    logging.info(f"TensorBoard 日志将保存在: {tensorboard_logdir}")
+
     if args.fp16:
         try:
             from apex import amp
@@ -195,6 +215,8 @@ def train(args, training_features, model, tokenizer):
 
     # model recover
     recover_step = utils.get_max_epoch_model(args.output_dir)
+    if recover_step :
+        save_path = os.path.join(args.output_dir, "ckpt-%d" % recover_step) 
 
     if recover_step:
         checkpoint_state_dict = utils.get_checkpoint_state_dict(args.output_dir, recover_step)
@@ -313,11 +335,15 @@ def train(args, training_features, model, tokenizer):
                 loss = loss.mean()  # mean() to average on multi-gpu parallel (not distributed) training
 
             train_iterator.set_description('Iter (loss=%5.3f) lr=%9.7f' % (loss.item(), scheduler.get_lr()[0]))
-            if args.wandb:
-                if (step + 1) % 50 == 0:
-                    wandb.log({'train/loss': loss.item()})
-                    wandb.log({'train/learning_rate': scheduler.get_lr()[0],
-                                   "train/global_step": step})
+            logging.info('Iter (loss=%5.3f) lr=%9.7f' % (loss.item(), scheduler.get_lr()[0]))
+            if True:
+                writer.add_scalar('train/loss', loss.item(), global_step)
+                writer.add_scalar('train/learning_rate', scheduler.get_lr()[0],global_step)
+                
+                if (global_step + 1) % 50 == 0:
+                    logging.info('global_step:%d (loss=%5.3f) lr=%9.7f' % (global_step, loss.item(), scheduler.get_lr()[0]))
+                    # wandb.log({'train/learning_rate': scheduler.get_lr()[0],
+                    #                "train/global_step": step})
             else:
                 if (step + 1) % 50 == 0:
                     print('train/loss', loss.item())
@@ -366,74 +392,76 @@ def train(args, training_features, model, tokenizer):
                     torch.save(optim_to_save, os.path.join(save_path, utils.OPTIM_NAME))
                     logger.info("Saving model checkpoint %d into %s", global_step, save_path)
 
-                    from test import main
+                    # from test import main
 
-                    flags = ['--model_type'     , args.model_type                          ,
-                    '--tokenizer_name'         , args.model_name_or_path             ,
-                     '--input_file'             , args.valid_file                  ,
-                     '--split'                  , 'valid'                         ,
-                     '--do_lower_case'          ,
-                     '--model_path'             , str(save_path)              ,
-                     '--max_seq_length'         , str(args.max_source_seq_length + args.max_target_seq_length) if args.label_cpt_decodewithpos else str(args.max_source_seq_length)             ,
-                     '--max_tgt_length'         , str(args.max_target_seq_length)             ,
-                     '--batch_size'             , '32'                            ,
-                     '--beam_size'              , '1'                             ,
-                     '--length_penalty'         , '0'                             ,
-                     '--forbid_duplicate_ngrams',
-                     '--mode'                   , 's2s'                           ,
-                     '--forbid_ignore_word'     , '"."'                           ,
-                     '--cached_features_file'   , str(os.path.join(args.output_dir, "cached_features_for_valid.pt")),
-                     '--add_vocab_file'         , args.add_vocab_file]
+                    # flags = ['--model_type'     , args.model_type                          ,
+                    # '--tokenizer_name'         , args.model_name_or_path             ,
+                    #  '--input_file'             , args.valid_file                  ,
+                    #  '--split'                  , 'valid'                         ,
+                    #  '--do_lower_case'          ,
+                    #  '--model_path'             , str(save_path)              ,
+                    #  '--max_seq_length'         , str(args.max_source_seq_length + args.max_target_seq_length) if args.label_cpt_decodewithpos else str(args.max_source_seq_length)             ,
+                    #  '--max_tgt_length'         , str(args.max_target_seq_length)             ,
+                    #  '--batch_size'             , '32'                            ,
+                    #  '--beam_size'              , '1'                             ,
+                    #  '--length_penalty'         , '0'                             ,
+                    #  '--forbid_duplicate_ngrams',
+                    #  '--mode'                   , 's2s'                           ,
+                    #  '--forbid_ignore_word'     , '"."'                           ,
+                    #  '--cached_features_file'   , str(os.path.join(args.output_dir, "cached_features_for_valid.pt")),
+                    #  '--add_vocab_file'         , args.add_vocab_file]
 
-                    if args.softmax_label_only:
-                        flags.append('--softmax_label_only')
-                    if args.soft_label:
-                        flags.append('--soft_label')
-                    if args.soft_label_hier_real:
-                        flags.append('--soft_label_hier_real_with_train_file')
-                        flags.append(args.train_file)
-                    if args.label_cpt_decodewithpos:
-                        flags.append('--target_no_offset')
+                    # if args.softmax_label_only:
+                    #     flags.append('--softmax_label_only')
+                    # if args.soft_label:
+                    #     flags.append('--soft_label')
+                    # if args.soft_label_hier_real:
+                    #     flags.append('--soft_label_hier_real_with_train_file')
+                    #     flags.append(args.train_file)
+                    # if args.label_cpt_decodewithpos:
+                    #     flags.append('--target_no_offset')
 
-                    if args.model_type == 'roberta':
-                        del flags[flags.index('--do_lower_case')]
+                    # if args.model_type == 'roberta':
+                    #     del flags[flags.index('--do_lower_case')]
 
-                    out = main(flags)
-                    if args.wandb:
-                        wandb.log({'eval/macro_f1': out['macro_f1'], 'eval/micro_f1': out['micro_f1']})
+                    # out = main(flags)
+                    # if args.wandb:
+                    #     wandb.log({'eval/macro_f1': out['macro_f1'], 'eval/micro_f1': out['micro_f1']})
 
-                    keep_save_model = False
-                    if out['macro_f1'] > best_macro_f1:
-                        best_macro_f1 = out['macro_f1']
-                        if best_macro_f1_path != best_micro_f1_path and best_macro_f1_path is not None:
-                            try:
-                                shutil.rmtree(best_macro_f1_path)
-                            except:
-                                pass
-                        best_macro_f1_path = save_path
-                        keep_save_model = True
+                    # keep_save_model = False
+                    # if out['macro_f1'] > best_macro_f1:
+                    #     best_macro_f1 = out['macro_f1']
+                    #     if best_macro_f1_path != best_micro_f1_path and best_macro_f1_path is not None:
+                    #         try:
+                    #             shutil.rmtree(best_macro_f1_path)
+                    #         except:
+                    #             pass
+                    #     best_macro_f1_path = save_path
+                    #     keep_save_model = True
 
-                    if out['micro_f1'] > best_micro_f1:
-                        best_micro_f1 = out['micro_f1']
-                        if best_micro_f1_path != best_macro_f1_path and best_micro_f1_path is not None:
-                            try:
-                                shutil.rmtree(best_micro_f1_path)
-                            except:
-                                pass
-                        best_micro_f1_path = save_path
-                        keep_save_model = True
+                    # if out['micro_f1'] > best_micro_f1:
+                    #     best_micro_f1 = out['micro_f1']
+                    #     if best_micro_f1_path != best_macro_f1_path and best_micro_f1_path is not None:
+                    #         try:
+                    #             shutil.rmtree(best_micro_f1_path)
+                    #         except:
+                    #             pass
+                    #     best_micro_f1_path = save_path
+                    #     keep_save_model = True
 
-                    if not keep_save_model:
-                        try:
-                            shutil.rmtree(save_path)
-                        except:
-                            pass
-                    print('best micro', best_micro_f1_path, best_micro_f1)
-                    print('best macro', best_macro_f1_path, best_macro_f1)
+                    # if not keep_save_model:
+                    #     try:
+                    #         shutil.rmtree(save_path)
+                    #     except:
+                    #         pass
+                    # print('best micro', best_micro_f1_path, best_micro_f1)
+                    # print('best macro', best_macro_f1_path, best_macro_f1)
 
+
+    writer.close()
     if args.local_rank in [-1, 0] and tb_writer:
         tb_writer.close()
-    return best_macro_f1_path, best_micro_f1_path
+    return save_path
 
 
 def get_args():
@@ -789,10 +817,10 @@ def get_model_and_tokenizer(args):
 
     return model, tokenizer, vs
 
-def test(args, best_macro_f1_path, best_micro_f1_path):
+def test(args, model_save_path):
     from test import main
     bout = None
-    for i, save_path in enumerate([best_micro_f1_path, best_macro_f1_path]):
+    for i, save_path in enumerate([model_save_path]):
         if save_path is None: continue
         flags = ['--model_type'     , args.model_type                          ,
             '--tokenizer_name'         , args.model_name_or_path             ,
@@ -909,9 +937,9 @@ def main():
                 else:
                     j >= vs
 
-    best_macro_f1_path, best_micro_f1_path = train(args, training_features, model, tokenizer)
+    save_path = train(args, training_features, model, tokenizer)
     if args.test_file:
-        test(args, best_macro_f1_path, best_micro_f1_path)
+        test(args, save_path)
 
 
 if __name__ == "__main__":

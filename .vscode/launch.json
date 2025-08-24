@@ -1,54 +1,82 @@
-// {
-//     // Use IntelliSense to learn about possible attributes.
-//     // Hover to view descriptions of existing attributes.
-//     // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
-//     "version": "0.2.0",
-//     "configurations": [
-
-//         {
-//             "name": "Python Debugger: Current File with Arguments",
-//             "type": "debugpy",
-//             "request": "launch",
-//             "program": "${file}",
-//             "console": "integratedTerminal",
-//             "args": "${command:pickArgs}"
-//         }
-//     ]
-// }
-
-
 {
     "version": "0.2.0",
     "configurations": [
         {
-            "name": "Python: Run with Args",
+            "name": "debug_ztf",
             "type": "debugpy", //python
             "request": "launch",
             "program": "run_ztf.py",
             // "program": "run.py",
             "console": "integratedTerminal",
             "args": [
-                "--train_file", "/root/autodl-tmp/HBGL/data/ztfData/train/train_data_clear_src_tgt_test.jsonl",
+                "--train_file", "/root/autodl-tmp/HBGL/data/ztfData/train/train_data_clear_src_tgt.jsonl",
                 "--output_dir", "models/ztf",
-                // "--model_type", "bert",
                 "--model_type", "bert",
                 // "--model_name_or_path", "bert-base-uncased",
-                // "--model_name_or_path", "hfl/chinese-bert-wwm-ext",
-                // "--model_name_or_path", "/root/.cache/huggingface/hub/models--hfl--chinese-roberta-wwm-ext/snapshots/5c58d0b8ec1d9014354d691c538661bf00bfdb44",
                 "--model_name_or_path", "/root/.cache/huggingface/hub/models--hfl--chinese-bert-wwm-ext/snapshots/2a995a880017c60e4683869e817130d8af548486",
                 "--do_lower_case",
                 "--max_source_seq_length", "509",
                 "--max_target_seq_length", "10",
                 "--per_gpu_train_batch_size", "12",
                 "--gradient_accumulation_steps", "1",
-                "--valid_file", "/root/autodl-tmp/HBGL/data/ztfData/eval/eval_data_clear_src_tgt.jsonl",
-                "--test_file", "/root/autodl-tmp/HBGL/data/ztfData/eval/eval_data_clear_src_tgt.jsonl",
+                "--valid_file", "/root/autodl-tmp/HBGL/data/ztfData/eval/eval_data_clear_src_tgt_10.jsonl",
+                "--test_file", "/root/autodl-tmp/HBGL/data/ztfData/eval/eval_data_clear_src_tgt_10.jsonl",
                 "--add_vocab_file", "./data/WebOfScience/label_map.pkl",
                 "--label_smoothing", "0",
                 // "--wandb",
                 "--learning_rate", "3e-5",
                 "--num_warmup_steps", "500",
-                "--num_training_steps", "96000",
+                "--num_training_steps", "2",
+                "--cache_dir", "cache",
+                "--random_prob", "0",
+                "--keep_prob", "0",
+                "--soft_label",
+                "--seed", "42",
+                "--label_cpt", "./data/WebOfScience/wos.taxnomy",
+                "--label_cpt_not_incr_mask_ratio",
+                // "--label_cpt_steps", "300",
+                "--label_cpt_steps", "2",
+                "--label_cpt_use_bce",
+                "--save_step", "2",
+                "--load_label_embedding_cache",
+            ],
+            "env": {
+                "TRAIN_FILE": "/root/autodl-tmp/HBGL/data/ztfData/train/train_data_clear_src_tgt_test.jsonl",
+                "OUTPUT_DIR": "models/wos",
+                "CACHE_DIR": "cache",
+                "seed": "42"
+            }
+        },
+        {
+            "name": "wos_debug",
+            "type": "debugpy", //python
+            "request": "launch",
+            "program": "run.py",
+            // "program": "run.py",
+            "console": "integratedTerminal",
+            "args": [
+                "--train_file", "/root/autodl-tmp/HBGL/data/WebOfScience/wos_train_generated_tl_3.json",
+                "--output_dir", "models/wos",
+                // "--model_type", "bert",
+                "--model_type", "bert",
+                // "--model_name_or_path", "/root/.cache/huggingface/hub/models--bert-base-uncased/snapshots/86b5e0934494bd15c9632b12f734a8a67f723594",
+                "--model_name_or_path", "/root/.cache/huggingface/hub/models--bert-base-uncased/snapshots/86b5e0934494bd15c9632b12f734a8a67f723594",
+                // "--model_name_or_path", "hfl/chinese-bert-wwm-ext",
+                // "--model_name_or_path", "/root/.cache/huggingface/hub/models--hfl--chinese-roberta-wwm-ext/snapshots/5c58d0b8ec1d9014354d691c538661bf00bfdb44",
+                // "--model_name_or_path", "/root/.cache/huggingface/hub/models--hfl--chinese-bert-wwm-ext/snapshots/2a995a880017c60e4683869e817130d8af548486",
+                "--do_lower_case",
+                "--max_source_seq_length", "509",
+                "--max_target_seq_length", "10",
+                "--per_gpu_train_batch_size", "12",
+                "--gradient_accumulation_steps", "1",
+                "--valid_file", "/root/autodl-tmp/HBGL/data/WebOfScience/wos_val_generated_3.json",
+                "--test_file", "/root/autodl-tmp/HBGL/data/WebOfScience/wos_test_generated.json",
+                "--add_vocab_file", "./data/WebOfScience/label_map.pkl",
+                "--label_smoothing", "0",
+                // "--wandb",
+                "--learning_rate", "3e-5",
+                "--num_warmup_steps", "500",
+                "--num_training_steps", "10",
                 "--cache_dir", "cache",
                 "--random_prob", "0",
                 "--keep_prob", "0",
@@ -62,11 +90,57 @@
                 "--save_step", "2",
             ],
             "env": {
-                "TRAIN_FILE": "./data/WebOfScience/wos_train_generated_tl.json",
+                "TRAIN_FILE": "/root/autodl-tmp/HBGL/data/WebOfScience/wos_train_generated_tl.json",
                 "OUTPUT_DIR": "models/wos",
                 "CACHE_DIR": "cache",
                 "seed": "42"
             }
-        }
+        },
+        {
+            "name": "debug_my_ztf",
+            "type": "debugpy", //python
+            "request": "launch",
+            "program": "/root/autodl-tmp/HBGL/hogan_ztf/run_ztf.py",
+            // "program": "run.py",
+            "console": "integratedTerminal",
+            "args": [
+                "--train_file", "/root/autodl-tmp/HBGL/data/ztfData/train/train_data_clear_src_tgt_100.jsonl",
+                "--output_dir", "/root/autodl-tmp/HBGL/hogan_ztf/models",
+                "--model_type", "bert",
+                // "--model_name_or_path", "bert-base-uncased",
+                "--model_name_or_path", "/root/.cache/huggingface/hub/models--hfl--chinese-bert-wwm-ext/snapshots/2a995a880017c60e4683869e817130d8af548486",
+                "--do_lower_case",
+                "--max_source_seq_length", "509",
+                "--max_target_seq_length", "10",
+                "--per_gpu_train_batch_size", "12",
+                "--gradient_accumulation_steps", "1",
+                "--valid_file", "/root/autodl-tmp/HBGL/data/ztfData/eval/eval_data_clear_src_tgt_10.jsonl",
+                "--test_file", "/root/autodl-tmp/HBGL/data/ztfData/eval/eval_data_clear_src_tgt_10.jsonl",
+                "--add_vocab_file", "./data/WebOfScience/label_map.pkl",
+                "--label_smoothing", "0",
+                // "--wandb",
+                "--learning_rate", "3e-5",
+                "--num_warmup_steps", "500",
+                "--num_training_steps", "2",
+                "--cache_dir", "cache",
+                "--random_prob", "0",
+                "--keep_prob", "0",
+                "--soft_label",
+                "--seed", "42",
+                "--label_cpt", "./data/WebOfScience/wos.taxnomy",
+                "--label_cpt_not_incr_mask_ratio",
+                // "--label_cpt_steps", "300",
+                "--label_cpt_steps", "2",
+                "--label_cpt_use_bce",
+                "--save_step", "2",
+                "--load_label_embedding_cache",
+            ],
+            "env": {
+                "TRAIN_FILE": "/root/autodl-tmp/HBGL/data/ztfData/train/train_data_clear_src_tgt_test.jsonl",
+                "OUTPUT_DIR": "models/wos",
+                "CACHE_DIR": "cache",
+                "seed": "42"
+            }
+        },
     ]
 }

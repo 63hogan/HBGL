@@ -20,10 +20,18 @@ from s2s_ft.modeling_decoding import BertForSeq2SeqDecoder, BertConfig
 from transformers.tokenization_bert import whitespace_tokenize
 import s2s_ft.s2s_loader as seq2seq_loader
 from s2s_ft.utils import load_and_cache_examples
-from transformers import BertTokenizer
+from transformers import \
+    BertTokenizer, RobertaTokenizer, XLMRobertaTokenizer, ElectraTokenizer
+from s2s_ft.tokenization_unilm import UnilmTokenizer
+from s2s_ft.tokenization_minilm import MinilmTokenizer
 
 TOKENIZER_CLASSES = {
     'bert': BertTokenizer,
+    'minilm': MinilmTokenizer,
+    'roberta': RobertaTokenizer,
+    'unilm': UnilmTokenizer,
+    'xlm-roberta': XLMRobertaTokenizer,
+    'electra': ElectraTokenizer,
 }
 
 
@@ -53,7 +61,7 @@ def ascii_print(text):
     print(text)
 
 
-def main(flags=None):
+def main():
     parser = argparse.ArgumentParser()
 
     # Required parameters
@@ -65,12 +73,12 @@ def main(flags=None):
                         help="Path to config.json for the model.")
 
     # tokenizer_name
-    parser.add_argument("--tokenizer_name", default=None, type=str, required=True,
+    parser.add_argument("--tokenizer_name", default=None, type=str, required=True, 
                         help="tokenizer name")
     parser.add_argument("--max_seq_length", default=512, type=int,
                         help="The maximum total input sequence length after WordPiece tokenization. \n"
-                            "Sequences longer than this will be truncated, and sequences shorter \n"
-                            "than this will be padded.")
+                             "Sequences longer than this will be truncated, and sequences shorter \n"
+                             "than this will be padded.")
 
     # decoding parameters
     parser.add_argument('--fp16', action='store_true',
@@ -100,6 +108,7 @@ def main(flags=None):
     parser.add_argument('--forbid_ignore_word', type=str, default=None,
                         help="Forbid the word during forbid_duplicate_ngrams")
     parser.add_argument("--min_len", default=1, type=int)
+    parser.add_argument('--need_score_traces', action='store_true')
     parser.add_argument('--ngram_size', type=int, default=3)
     parser.add_argument('--mode', default="s2s",
                         choices=["s2s", "l2r", "both"])
@@ -115,19 +124,12 @@ def main(flags=None):
                         help="Using position shift for fine-tuning.")
     parser.add_argument("--cache_dir", default=None, type=str,
                         help="Where do you want to store the pre-trained models downloaded from s3")
-    parser.add_argument("--add_vocab_file", type=str, default=None)
-    parser.add_argument("--cached_features_file", type=str, default=None)
-    parser.add_argument('--softmax_label_only', action='store_true')
-    parser.add_argument('--soft_label', action='store_true')
-    parser.add_argument('--soft_label_hier_real_with_train_file', default=None, type=str)
 
-    if flags:
-        print(flags)
-        args = parser.parse_args(flags)
-    else:
-        args = parser.parse_args()
+    args = parser.parse_args()
 
-
+    if args.need_score_traces and args.beam_size <= 1:
+        raise ValueError(
+            "Score trace is only available for beam search with beam size > 1.")
     if args.max_tgt_length >= args.max_seq_length - 2:
         raise ValueError("Maximum tgt length exceeds max seq length - 2.")
 
@@ -149,19 +151,10 @@ def main(flags=None):
         torch.manual_seed(random_seed)
         if n_gpu > 0:
             torch.cuda.manual_seed_all(args.seed)
-
+    
     tokenizer = TOKENIZER_CLASSES[args.model_type].from_pretrained(
-        args.tokenizer_name, do_lower_case=args.do_lower_case,
+        args.tokenizer_name, do_lower_case=args.do_lower_case, 
         cache_dir=args.cache_dir if args.cache_dir else None)
-
-    if args.add_vocab_file:
-        import pickle
-        with open(args.add_vocab_file, 'rb') as f:
-            label_map = pickle.load(f)
-        labels_key = list(label_map.keys())
-        # tokenizer.add_special_tokens({'additional_special_tokens': [label_map[label] for label in labels_key]})
-        tokenizer.add_tokens([label_map[label] for label in labels_key])
-        add_token_num = len(labels_key)
 
     if args.model_type == "roberta":
         vocab = tokenizer.encoder
@@ -205,7 +198,7 @@ def main(flags=None):
         bi_uni_pipeline.append(seq2seq_loader.Preprocess4Seq2seqDecoder(
             list(vocab.keys()), tokenizer.convert_tokens_to_ids, args.max_seq_length,
             max_tgt_length=args.max_tgt_length, pos_shift=args.pos_shift,
-            source_type_id=config.source_type_id, target_type_id=config.target_type_id,
+            source_type_id=config.source_type_id, target_type_id=config.target_type_id, 
             cls_token=tokenizer.cls_token, sep_token=tokenizer.sep_token, pad_token=tokenizer.pad_token))
 
         found_checkpoint_flag = True
@@ -214,36 +207,8 @@ def main(flags=None):
             length_penalty=args.length_penalty, eos_id=eos_word_ids, sos_id=sos_word_id,
             forbid_duplicate_ngrams=args.forbid_duplicate_ngrams, forbid_ignore_set=forbid_ignore_set,
             ngram_size=args.ngram_size, min_len=args.min_len, mode=args.mode,
-            max_position_embeddings=args.max_seq_length, pos_shift=args.pos_shift,
+            max_position_embeddings=args.max_seq_length, pos_shift=args.pos_shift, 
         )
-
-        if args.softmax_label_only and args.add_vocab_file:
-            label_tokens_start_index = model.bert.embeddings.word_embeddings.num_embeddings - add_token_num
-            model.label_start_index = label_tokens_start_index
-
-        if args.soft_label:
-            model.soft_label = args.soft_label
-            label_tokens_start_index = model.bert.embeddings.word_embeddings.num_embeddings - add_token_num
-            model.label_start_index = label_tokens_start_index
-
-            if args.soft_label_hier_real_with_train_file:
-                hier_labels = None
-                for line in open(args.soft_label_hier_real_with_train_file):
-                    if hier_labels:
-                        for i, l in enumerate(json.loads(line)['tgt']):
-                            hier_labels[i] |=  set(l)
-                    else:
-                        hier_labels = [set(i) for i in json.loads(line)['tgt']]
-                hier_labels = [tokenizer.convert_tokens_to_ids(list([j.lower() for j in i])) for i in hier_labels]
-
-                def to_multi_hot(label):
-                    _label = torch.zeros(model.config.vocab_size)
-                    for i in label:
-                        _label[i] = 1
-                    return _label.bool()
-
-                model.hier_labels = [to_multi_hot(i) for i in hier_labels]
-                model.soft_label_hier_real = True
 
         if args.fp16:
             model.half()
@@ -258,16 +223,9 @@ def main(flags=None):
         if args.pos_shift:
             max_src_length += 1
 
-        num_lines = sum(1 for line in open(args.input_file))
-        if num_lines < -1:
-            to_pred = load_and_cache_examples(
-                args.input_file, tokenizer, local_rank=-1,
-                cached_features_file=args.cached_features_file, shuffle=False, eval_mode=True)
-        else:
-            from s2s_ft.utils import load_and_cache_examples_fast
-            to_pred = load_and_cache_examples_fast(
-                args.input_file, tokenizer, local_rank=-1,
-                cached_features_file=args.cached_features_file, shuffle=False, eval_mode=True)
+        to_pred = load_and_cache_examples(
+            args.input_file, tokenizer, local_rank=-1, 
+            cached_features_file=None, shuffle=False, eval_mode=True)
 
         input_lines = []
         for line in to_pred:
@@ -326,6 +284,9 @@ def main(flags=None):
                         output_lines[buf_id[i]] = output_sequence
                         if first_batch or batch_count % 50 == 0:
                             logger.info("{} = {}".format(buf_id[i], output_sequence))
+                        if args.need_score_traces:
+                            score_trace_list[buf_id[i]] = {
+                                'scores': traces['scores'][i], 'wids': traces['wids'][i], 'ptrs': traces['ptrs'][i]}
                 pbar.update(1)
                 first_batch = False
         if args.output_file:
@@ -337,41 +298,16 @@ def main(flags=None):
                 fout.write(l)
                 fout.write("\n")
 
-        import pickle
-        from eval import evaluate
-        def token_to_id(token):
-            token = token.lower()
-            try:
-                token = int(token.replace('[a_', '').replace(']', ''))
-                token = 0 if token >= len(label_map) else token
-                return token
-            except:
-                return 0
-
-        if args.model_type == 'roberta':
-            def roberta_token_to_id(token):
-                token = token.replace("<s>", '').replace('[A_', ' ').replace(']', ' ').split(' ')
-                token = [int(i) for i in token if i != '']
-                return token
-            predict_labels = [roberta_token_to_id(i) for i in output_lines]
-        else:
-            predict_labels = [i.replace("\n", '').split(' ') for i in output_lines]
-            predict_labels = [list(set([token_to_id(j) for j  in i])) for i in predict_labels]
-        with open(args.input_file) as f:
-            gd_labels = [json.loads(i)['tgt'] for i in f]
-            gd_labels = [[token_to_id(j) for j  in i.split(' ')] for i in gd_labels]
-
-        with open(args.add_vocab_file, 'rb') as f:
-            label_map = pickle.load(f)
-        id2label = {token_to_id(label_map[k]): k for k in label_map}
-        out = evaluate(predict_labels, gd_labels, id2label, as_sample=True)
-        del out['full']
-        print(out)
-        return out
+        if args.need_score_traces:
+            with open(fn_out + ".trace.pickle", "wb") as fout_trace:
+                pickle.dump(
+                    {"version": 0.0, "num_samples": len(input_lines)}, fout_trace)
+                for x in score_trace_list:
+                    pickle.dump(x, fout_trace)
 
     if not found_checkpoint_flag:
         logger.info("Not found the model checkpoint file!")
 
 
 if __name__ == "__main__":
-    print(main())
+    main()

@@ -400,7 +400,7 @@ def train(args, training_features, model, tokenizer):
                     torch.save(optim_to_save, os.path.join(save_path, utils.OPTIM_NAME))
                     logger.info("Saving model checkpoint %d into %s", global_step, save_path)
 
-                    from test import main
+                    from test_ztf import main
 
                     flags = ['--model_type'     , args.model_type                          ,
                     '--tokenizer_name'         , args.model_name_or_path             ,
@@ -889,7 +889,7 @@ def get_model_and_tokenizer(args):
     return model, tokenizer, vs
 
 def test(args, best_macro_f1_path, best_micro_f1_path):
-    from test import main
+    from test_ztf import main
     bout = None
     for i, save_path in enumerate([best_micro_f1_path, best_macro_f1_path]):
         if save_path is None: continue
