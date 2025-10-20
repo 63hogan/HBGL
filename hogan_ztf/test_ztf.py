@@ -24,7 +24,7 @@ from transformers.tokenization_bert import whitespace_tokenize
 import ztf_s2s_ft.s2s_loader as seq2seq_loader
 from ztf_s2s_ft.utils import load_and_cache_examples
 from transformers import BertTokenizer
-
+from ztf_eval import eval_output
 TOKENIZER_CLASSES = {
     'bert': BertTokenizer,
 }
@@ -285,6 +285,7 @@ def main(flags=None):
         to_pred = load_and_cache_examples(
                 args.input_file, tokenizer, local_rank=-1,
                 cached_features_file=args.cached_features_file, shuffle=False, eval_mode=True)
+        print("test input file: %s to_pred num: %d", args.input_file, len(to_pred))
 
         input_lines = []
         for line in to_pred:
@@ -349,11 +350,12 @@ def main(flags=None):
             fn_out = args.output_file
         else:
             fn_out = model_recover_path+'.'+args.split
+        
         with open(fn_out, "w", encoding="utf-8") as fout:
             for l in output_lines:
                 fout.write(l)
                 fout.write("\n")
-
+        eval_output(fn_out)
         # import pickle
         # from eval import evaluate
         # def token_to_id(token):

@@ -16,3 +16,5 @@ tensorboard_log/
 data/
 hogan_ztf/tensor_log/*
 *.log
+apex/
+roberta_model/

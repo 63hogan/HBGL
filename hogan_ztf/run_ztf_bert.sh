@@ -5,17 +5,26 @@ OUTPUT_DIR=/root/autodl-tmp/HBGL/hogan_ztf/models/
 CACHE_DIR=.cache
 TRAIN_FILE=/root/autodl-tmp/HBGL/data/ztfData/train/train_data_clear_src_tgt.jsonl
 
+
+MODEL_PATH=/root/.cache/huggingface/hub/models--hfl--chinese-bert-wwm-ext/snapshots/2a995a880017c60e4683869e817130d8af548486/
+label_emb_save_path = ''
+train_model_save_path = ''
+train_data_path = ''
+eval_data_output_path = ''
+
+
 python /root/autodl-tmp/HBGL/hogan_ztf/run_ztf.py\
     --train_file ${TRAIN_FILE} --output_dir ${OUTPUT_DIR}\
-    --model_type bert --model_name_or_path /root/.cache/huggingface/hub/models--hfl--chinese-bert-wwm-ext/snapshots/2a995a880017c60e4683869e817130d8af548486/ \
+    --model_type bert --model_name_or_path  ${MODEL_PATH}\
     --do_lower_case --max_source_seq_length 490 --max_target_seq_length 8\
     --per_gpu_train_batch_size 24 --gradient_accumulation_steps 2\
     --valid_file /root/autodl-tmp/HBGL/data/ztfData/eval/eval_data_clear_src_tgt.jsonl \
-    --test_file /root/autodl-tmp/HBGL/data/ztfData/eval/eval_data_clear_src_tgt.jsonl \
+    --test_file /root/autodl-tmp/HBGL/data/ztfData/eval/ori_eval_data_src_tgt.jsonl \
     --add_vocab_file ./data/WebOfScience/label_map.pkl \
     --label_smoothing 0\
     --save_steps 550 \
     --learning_rate 3e-5 --num_warmup_steps 500 --num_training_steps -1 --cache_dir ${CACHE_DIR}\
     --soft_label --seed ${seed} \
     --label_cpt ./data/WebOfScience/wos.taxnomy --label_cpt_not_incr_mask_ratio --label_cpt_steps 300 --label_cpt_use_bce \
-    --load_label_embedding_cache
+    --load_label_embedding_cache \
+    --fp16

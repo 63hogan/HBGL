@@ -7,11 +7,14 @@ import logging
 import os
 import json
 import random
+import re
 
 import numpy as np
 import torch
 from torch.utils.data import (DataLoader, SequentialSampler)
 from torch.utils.data.distributed import DistributedSampler
+from torch.cuda.amp import GradScaler, autocast
+from transformers import AdamW, get_linear_schedule_with_warmup
 import wandb
 import tqdm
 
@@ -49,98 +52,6 @@ MODEL_CLASSES = {
     'roberta': (RobertaConfig, BertTokenizer),
 }
 
-def training_cpt(args, tokenizer, input_ids, attention_mask,  position_ids, _init_label_emb, num_hiers, reversed_hiers):
-
-    label_nums = input_ids.shape[0] - 2
-
-    model = BertForMaskedLM.from_pretrained(args.model_name_or_path)
-    model = model.train()
-    model.cuda()
-
-    init_label_emb = _init_label_emb.float().cuda().requires_grad_()
-    torch.save(init_label_emb.cpu(), 'label_name_emb_before_train.pt')
-
-    optimizer_grouped_parameters = [
-        {'params': [init_label_emb, ], 'weight_decay': 0.0}
-    ]
-    cpt_optimizer = AdamW(optimizer_grouped_parameters, lr=args.label_cpt_lr, eps=args.adam_epsilon)
-
-    mask_ratio = 0.15
-    bs = args.label_cpt_bsz
-    b_input_ids = input_ids.unsqueeze(0).repeat(bs, 1).cuda().long()
-    position_ids = position_ids.unsqueeze(0).repeat(bs, 1).cuda().long()
-
-    if args.label_cpt_decodewithpos: #False
-        position_ids[:, 1:-1] += args.max_source_seq_length - 1
-        position_ids[:, -1] = args.max_source_seq_length + args.max_target_seq_length - 1
-    attention_mask = attention_mask.unsqueeze(0).repeat(bs, 1, 1).cuda().long()
-    for step in range(args.label_cpt_steps):
-        if args.label_cpt_not_incr_mask_ratio: #False
-            c_mask_ratio = mask_ratio
-        else:
-            c_mask_ratio = mask_ratio + (step / args.label_cpt_steps) * 0.3
-        inputs_embeds = torch.cat([model.bert.embeddings.word_embeddings.weight[tokenizer.cls_token_id].unsqueeze(0),
-                                   init_label_emb,
-                                   model.bert.embeddings.word_embeddings.weight[tokenizer.sep_token_id].unsqueeze(0),])
-        inputs_embeds = inputs_embeds.unsqueeze(0).repeat(bs, 1, 1).cuda()
-        mask_tokens = ~torch.bernoulli(torch.ones_like(b_input_ids) * (1 - c_mask_ratio)).bool()
-        labels = torch.ones_like(b_input_ids).long() * -100
-        # keep cls & sep unmask
-        mask_tokens[:, 0] = 0
-        mask_tokens[:, -1] = 0
-        labels[mask_tokens] = b_input_ids[mask_tokens] - model.bert.embeddings.word_embeddings.num_embeddings #从 0 开始
-        inputs_embeds[mask_tokens] = model.bert.embeddings.word_embeddings.weight[tokenizer.mask_token_id]
-        outputs = model.bert(
-            None,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            inputs_embeds=inputs_embeds,
-        )
-        sequence_output = outputs[0]
-        hidden_states = model.cls.predictions.transform(sequence_output)
-        prediction_scores = hidden_states @ init_label_emb.T
-
-        if args.label_cpt_use_bce: #True
-            loss_fct = BCEWithLogitsLoss()  # -100 index = padding token
-            with torch.no_grad():
-                bce_labels = torch.zeros_like(prediction_scores)
-                _bce_labels = []
-                for b in range(bs):
-                    l = labels[b][mask_tokens[b]].tolist()
-                    bce_l = bce_labels[b][mask_tokens[b]]
-                    c = defaultdict(list)
-                    lmap = {}
-                    for il in l:
-                        if il not in num_hiers: #叶子节点
-                            # last labels
-                            p = reversed_hiers[il] # il 的父节点  
-                            c[p].append(il)
-                            lmap[il] = p
-                    for i, il in enumerate(l):
-                        if il not in lmap:
-                            bce_l[i][il] = 1
-                        else:
-                            for j in c[lmap[il]]:
-                                bce_l[i][j] = 1
-                    _bce_labels.append(bce_l)
-                bce_labels = torch.cat(_bce_labels, dim=0)
-                logging.info(bce_labels.sum())
-            masked_lm_loss = loss_fct(prediction_scores[mask_tokens], bce_labels)
-        else:
-            loss_fct = CrossEntropyLoss()  # -100 index = padding token
-            masked_lm_loss = loss_fct(prediction_scores.view(-1, label_nums), labels.view(-1))
-
-        masked_lm_loss.backward()
-        cpt_optimizer.step()
-        model.zero_grad()
-        init_label_emb.grad = None
-        logging.info("step %d, masked_lm_loss: %f", step, masked_lm_loss.item())
-        print(f'step {step}', masked_lm_loss.item())
-        # logging.info(f"step {step}, masked_lm_loss: {masked_lm_loss.item()}")
-    torch.save(init_label_emb.cpu(), 'label_name_emb_after_train.pt')
-    return init_label_emb
-
-
 def train_batch_labels(args, tokenizer, input_ids, attention_mask,  position_ids, _init_label_emb, label_child_set, label_parent_dic):
 
     label_nums = input_ids.shape[0] - 2
@@ -156,6 +67,15 @@ def train_batch_labels(args, tokenizer, input_ids, attention_mask,  position_ids
         {'params': [init_label_emb, ], 'weight_decay': 0.0}
     ]
     cpt_optimizer = AdamW(optimizer_grouped_parameters, lr=args.label_cpt_lr, eps=args.adam_epsilon)
+
+    scaler = GradScaler(enabled=args.fp16)
+    # if args.fp16:
+    #     try:
+    #         from apex import amp
+    #     except ImportError:
+    #         raise ImportError("Please install apex from https://www.github.com/nvidia/apex to use fp16 training.")
+    #     # 使用 amp.initialize 包装模型和优化器
+    #     model, cpt_optimizer = amp.initialize(model, cpt_optimizer, opt_level=args.fp16_opt_level)
 
     mask_ratio = 0.15
     bs = args.label_cpt_bsz
@@ -190,62 +110,76 @@ def train_batch_labels(args, tokenizer, input_ids, attention_mask,  position_ids
         inputs_embeds[mask_tokens] = model.bert.embeddings.word_embeddings.weight[tokenizer.mask_token_id]
         ##TODO set  target type id
         
-        outputs = model.bert(
-            None,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            inputs_embeds=inputs_embeds,
-        )
-        sequence_output = outputs[0]
-        hidden_states = model.cls.predictions.transform(sequence_output)
-        prediction_scores = hidden_states @ init_label_emb.T
+        with autocast(enabled=args.fp16):
+            outputs = model.bert(
+                None,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                inputs_embeds=inputs_embeds,
+            )
+            sequence_output = outputs[0]
+            hidden_states = model.cls.predictions.transform(sequence_output)
+            prediction_scores = hidden_states @ init_label_emb.T
 
-        if args.label_cpt_use_bce: #True
-            loss_fct = BCEWithLogitsLoss()  # -100 index = padding token
-            with torch.no_grad():
-                bce_labels = torch.zeros_like(prediction_scores)
-                _bce_labels = []
-                for b in range(bs):
-                    # l = labels[b][mask_tokens[b]].tolist()
-                    # bce_l = bce_labels[b][mask_tokens[b]]
-                    
-                    b_mask_tokens_indices = torch.nonzero(mask_tokens[b], as_tuple=True)[0]
-                    l = labels[b][b_mask_tokens_indices].tolist()
-                    bce_l = bce_labels[b][b_mask_tokens_indices]
-                    
-                    
-                    c = defaultdict(list)
-                    lmap = {}
-                    for il in l:
-                        if il not in label_child_set: #叶子节点
-                            # last labels
-                            if il in label_parent_dic:
-                                p = label_parent_dic[il] # il 的父节点  
-                                c[p].append(il)
-                                lmap[il] = p
-                    
-                    for i, il in enumerate(l):
-                        if il not in lmap:
-                            bce_l[i][il] = 1
-                        else:
-                            for j in c[lmap[il]]:
-                                bce_l[i][j] = 1
-                    _bce_labels.append(bce_l)
-                bce_labels = torch.cat(_bce_labels, dim=0)
-                # logging.info(bce_labels.sum())
-            masked_lm_loss = loss_fct(prediction_scores[mask_tokens], bce_labels)
-        else:
-            loss_fct = CrossEntropyLoss()  # -100 index = padding token
-            masked_lm_loss = loss_fct(prediction_scores.view(-1, label_nums), labels.view(-1))
+            if args.label_cpt_use_bce: #True
+                loss_fct = BCEWithLogitsLoss()  # -100 index = padding token
+                with torch.no_grad():
+                    bce_labels = torch.zeros_like(prediction_scores)
+                    _bce_labels = []
+                    for b in range(bs):
+                        # l = labels[b][mask_tokens[b]].tolist()
+                        # bce_l = bce_labels[b][mask_tokens[b]]
+                        
+                        b_mask_tokens_indices = torch.nonzero(mask_tokens[b], as_tuple=True)[0]
+                        l = labels[b][b_mask_tokens_indices].tolist()
+                        bce_l = bce_labels[b][b_mask_tokens_indices]
+                        
+                        
+                        c = defaultdict(list)
+                        lmap = {}
+                        for il in l:
+                            if il not in label_child_set: #叶子节点
+                                # last labels
+                                if il in label_parent_dic:
+                                    p = label_parent_dic[il] # il 的父节点  
+                                    c[p].append(il)
+                                    lmap[il] = p
+                        
+                        for i, il in enumerate(l):
+                            if il not in lmap:
+                                bce_l[i][il] = 1
+                            else:
+                                for j in c[lmap[il]]:
+                                    bce_l[i][j] = 1
+                        _bce_labels.append(bce_l)
+                    bce_labels = torch.cat(_bce_labels, dim=0)
+                    # logging.info(bce_labels.sum())
+                masked_lm_loss = loss_fct(prediction_scores[mask_tokens], bce_labels)
+            else:
+                loss_fct = CrossEntropyLoss()  # -100 index = padding token
+                masked_lm_loss = loss_fct(prediction_scores.view(-1, label_nums), labels.view(-1))
 
-        masked_lm_loss.backward()
-        cpt_optimizer.step()
-        model.zero_grad()
+        scaler.scale(masked_lm_loss).backward()
+        scaler.step(cpt_optimizer)
+        scaler.update()
+        
+        # if args.fp16:
+        #     with amp.scale_loss(masked_lm_loss, cpt_optimizer) as scaled_loss:
+        #         scaled_loss.backward()
+        # else:
+        #     masked_lm_loss.backward()
+        
+        # cpt_optimizer.step()
+        # model.zero_grad()
         init_label_emb.grad = None
         logging.info("step %d, masked_lm_loss: %f", step, masked_lm_loss.item())
         # print(f'step {step}', masked_lm_loss.item())
         # logging.info(f'step {step}, masked_lm_loss.item()')
     # torch.save(init_label_emb.cpu(), 'label_name_emb_after_train.pt')
+    del model
+    del cpt_optimizer
+    torch.cuda.empty_cache()
+    
     return init_label_emb.detach().cpu()
 
 
@@ -276,6 +210,8 @@ def train_label_name_embedding(args):
         reuse_position_embedding=True,
         cache_dir=args.cache_dir if args.cache_dir else None)
 
+    label_emb_cache_path = args.output_dir + '/label_name_emb_after_train.pt'
+    
     if args.add_vocab_file:
         init_label_emb = None
         ztf_map = read_key_value_file(args.ztf_path)
@@ -291,9 +227,9 @@ def train_label_name_embedding(args):
             token = '__'+ label+ '__'
             tokenizer.add_tokens([token.lower()])
 
-        if args.load_label_embedding_cache and os.path.exists('/root/autodl-tmp/HBGL/label_name_emb_before_train.pt'):
-            logging.info("直接从本地加载 label_name_emb_after_train.pt")
-            init_label_emb = torch.load('/root/autodl-tmp/HBGL/label_name_emb_after_train.pt')
+        if args.load_label_embedding_cache and os.path.exists(label_emb_cache_path):
+            logging.info("直接从本地加载 label embedding: %s", label_emb_cache_path)
+            init_label_emb = torch.load(label_emb_cache_path)
         else:
                             
             if args.label_cpt:
@@ -386,12 +322,12 @@ def train_label_name_embedding(args):
                     )
                     trained_label_emb[batch_original_indices] = updated_batch_emb
                     batch_idx += 1
-                    # ##TODO debug
-                    # if batch_idx > 2:
+                    ##TODO debug
+                    # if batch_idx > 1:
                     #     break
             
                 init_label_emb = trained_label_emb.detach().cpu()
-                torch.save(init_label_emb, 'label_name_emb_after_train.pt')
+                torch.save(init_label_emb, label_emb_cache_path)
         
         model.bert.embeddings.word_embeddings.weight.data = torch.cat([model.bert.embeddings.word_embeddings.weight.data, init_label_emb], dim=0)
         model.bert.embeddings.word_embeddings.num_embeddings += len(label_tokens)
@@ -412,7 +348,7 @@ def train_label_name_embedding(args):
 
     return model, tokenizer, vs
 
-def prepare_for_training(args, model, checkpoint_state_dict, amp):
+def prepare_for_training(args, model, checkpoint_state_dict ):
     no_decay = ['bias', 'LayerNorm.weight']
     optimizer_grouped_parameters = [
         {'params': [p for n, p in model.named_parameters() if not any(nd in n for nd in no_decay)],
@@ -425,42 +361,42 @@ def prepare_for_training(args, model, checkpoint_state_dict, amp):
         optimizer.load_state_dict(checkpoint_state_dict['optimizer'])
         model.load_state_dict(checkpoint_state_dict['model'])
 
-        # then remove optimizer state to make amp happy
-        # https://github.com/NVIDIA/apex/issues/480#issuecomment-587154020
-        if amp:
-            optimizer.state = {}
+    #     # then remove optimizer state to make amp happy
+    #     # https://github.com/NVIDIA/apex/issues/480#issuecomment-587154020
+    #     if amp:
+    #         optimizer.state = {}
 
-    if amp:
-        model, optimizer = amp.initialize(model, optimizer, opt_level=args.fp16_opt_level)
-        if checkpoint_state_dict:
-            amp.load_state_dict(checkpoint_state_dict['amp'])
+    # if amp:
+    #     model, optimizer = amp.initialize(model, optimizer, opt_level=args.fp16_opt_level)
+    #     if checkpoint_state_dict:
+    #         amp.load_state_dict(checkpoint_state_dict['amp'])
 
-            # Black Tech from https://github.com/NVIDIA/apex/issues/480#issuecomment-587154020
-            # forward, backward, optimizer step, zero_grad
-            random_input = {'source_ids': torch.ones(size=(2, 2), device=args.device, dtype=torch.long),
-                            'target_ids': torch.ones(size=(2, 2), device=args.device, dtype=torch.long),
-                            'label_ids': torch.ones(size=(2, 2), device=args.device, dtype=torch.long),
-                            'pseudo_ids': torch.ones(size=(2, 2), device=args.device, dtype=torch.long),
-                            'num_source_tokens': torch.zeros(size=(2,), device=args.device, dtype=torch.long),
-                            'num_target_tokens': torch.zeros(size=(2,), device=args.device, dtype=torch.long)}
-            loss = model(**random_input)
-            logging.info("Loss = %f" % loss.cpu().item())
-            with amp.scale_loss(loss, optimizer) as scaled_loss:
-                scaled_loss.backward()
-            optimizer.step()
-            model.zero_grad()
+    #         # Black Tech from https://github.com/NVIDIA/apex/issues/480#issuecomment-587154020
+    #         # forward, backward, optimizer step, zero_grad
+    #         random_input = {'source_ids': torch.ones(size=(2, 2), device=args.device, dtype=torch.long),
+    #                         'target_ids': torch.ones(size=(2, 2), device=args.device, dtype=torch.long),
+    #                         'label_ids': torch.ones(size=(2, 2), device=args.device, dtype=torch.long),
+    #                         'pseudo_ids': torch.ones(size=(2, 2), device=args.device, dtype=torch.long),
+    #                         'num_source_tokens': torch.zeros(size=(2,), device=args.device, dtype=torch.long),
+    #                         'num_target_tokens': torch.zeros(size=(2,), device=args.device, dtype=torch.long)}
+    #         loss = model(**random_input)
+    #         logging.info("Loss = %f" % loss.cpu().item())
+    #         with amp.scale_loss(loss, optimizer) as scaled_loss:
+    #             scaled_loss.backward()
+    #         optimizer.step()
+    #         model.zero_grad()
 
-            # then load optimizer state_dict again (this time without removing optimizer.state)
-            optimizer.load_state_dict(checkpoint_state_dict['optimizer'])
+    #         # then load optimizer state_dict again (this time without removing optimizer.state)
+    #         optimizer.load_state_dict(checkpoint_state_dict['optimizer'])
 
-    # multi-gpu training (should be after apex fp16 initialization)
-    if args.n_gpu > 1:
-        model = torch.nn.DataParallel(model)
+    # # multi-gpu training (should be after apex fp16 initialization)
+    # if args.n_gpu > 1:
+    #     model = torch.nn.DataParallel(model)
 
-    # Distributed training (should be after apex fp16 initialization)
-    if args.local_rank != -1:
-        model = torch.nn.parallel.DistributedDataParallel(
-            model, device_ids=[args.local_rank], output_device=args.local_rank, find_unused_parameters=True)
+    # # Distributed training (should be after apex fp16 initialization)
+    # if args.local_rank != -1:
+    #     model = torch.nn.parallel.DistributedDataParallel(
+    #         model, device_ids=[args.local_rank], output_device=args.local_rank, find_unused_parameters=True)
 
     return model, optimizer
 
@@ -468,19 +404,22 @@ def prepare_for_training(args, model, checkpoint_state_dict, amp):
 def train(args, training_features, model, tokenizer):
     """ Train the model """
     
-    tensorboard_logdir = f"/root/autodl-tmp/HBGL/hogan_ztf/tensor_log/my_experiment_{int(time.time())}"
+    
+    tensorboard_logdir = f"/tensor_log/my_experiment_{int(time.time())}"
+    tensorboard_logdir = args.output_dir + tensorboard_logdir
+    
     writer = SummaryWriter(tensorboard_logdir)
 
     logging.info(f"TensorBoard 日志将保存在: {tensorboard_logdir}")
     save_path = None
 
-    if args.fp16:
-        try:
-            from apex import amp
-        except ImportError:
-            raise ImportError("Please install apex from https://www.github.com/nvidia/apex to use fp16 training.")
-    else:
-        amp = None
+    # if args.fp16:
+    #     try:
+    #         from apex import amp
+    #     except ImportError:
+    #         raise ImportError("Please install apex from https://www.github.com/nvidia/apex to use fp16 training.")
+    # else:
+    #     amp = None
 
     # model recover
     recover_step = utils.get_max_epoch_model(args.output_dir)
@@ -493,8 +432,12 @@ def train(args, training_features, model, tokenizer):
         checkpoint_state_dict = None
 
     model.to(args.device)
-    model, optimizer = prepare_for_training(args, model, checkpoint_state_dict, amp=amp)
+    model, optimizer = prepare_for_training(args, model, checkpoint_state_dict)
 
+    scaler = GradScaler(enabled=args.fp16)
+    if checkpoint_state_dict and 'scaler' in checkpoint_state_dict:
+        scaler.load_state_dict(checkpoint_state_dict['scaler'])
+        
     per_node_train_batch_size = args.per_gpu_train_batch_size * args.n_gpu * args.gradient_accumulation_steps
     train_batch_size = per_node_train_batch_size * (torch.distributed.get_world_size() if args.local_rank != -1 else 1)
     global_step = recover_step if recover_step else 0
@@ -579,7 +522,9 @@ def train(args, training_features, model, tokenizer):
                         'num_source_tokens': batch[5],
                         'num_target_tokens': batch[6]}
 
-            loss = model(**inputs)
+            with autocast(enabled=args.fp16):
+                loss = model(**inputs)
+            # loss = model(**inputs)
             if args.n_gpu > 1:
                 loss = loss.mean()  # mean() to average on multi-gpu parallel (not distributed) training
 
@@ -600,23 +545,29 @@ def train(args, training_features, model, tokenizer):
             if args.gradient_accumulation_steps > 1:
                 loss = loss / args.gradient_accumulation_steps
 
-            if args.fp16:
-                with amp.scale_loss(loss, optimizer) as scaled_loss:
-                    scaled_loss.backward()
-            else:
-                loss.backward()
+            scaler.scale(loss).backward()
+            # if args.fp16:
+            #     with amp.scale_loss(loss, optimizer) as scaled_loss:
+            #         scaled_loss.backward()
+            # else:
+            #     loss.backward()
 
 
             logging_loss += loss.item()
             if (step + 1) % args.gradient_accumulation_steps == 0:
                 if args.fp16:
-                    torch.nn.utils.clip_grad_norm_(amp.master_params(optimizer), args.max_grad_norm)
-                else:
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
-
-                optimizer.step()
-                scheduler.step()  # Update learning rate schedule
+                    # torch.nn.utils.clip_grad_norm_(amp.master_params(optimizer), args.max_grad_norm)
+                    scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
+                
+                scaler.step(optimizer)
+                scaler.update()
+                scheduler.step()
                 model.zero_grad()
+                
+                # optimizer.step()
+                # scheduler.step()  # Update learning rate schedule
+                # model.zero_grad()
                 global_step += 1
 
                 if args.local_rank in [-1, 0] and args.logging_steps > 0 and global_step % args.logging_steps == 0:
@@ -637,7 +588,8 @@ def train(args, training_features, model, tokenizer):
                         "lr_scheduler": scheduler.state_dict(),
                     }
                     if args.fp16:
-                        optim_to_save["amp"] = amp.state_dict()
+                        # optim_to_save["amp"] = amp.state_dict()
+                        optim_to_save["scaler"] = scaler.state_dict()
                     torch.save(optim_to_save, os.path.join(save_path, utils.OPTIM_NAME))
                     logging.info("Saving model checkpoint %d into %s", global_step, save_path)
 
@@ -704,7 +656,7 @@ def get_args():
                         help="Max gradient norm.")
     parser.add_argument("--num_training_steps", default=-1, type=int,
                         help="set total number of training steps to perform")
-    parser.add_argument("--num_training_epochs", default=10, type=int,
+    parser.add_argument("--num_training_epochs", default=20, type=int,
                         help="set total number of training epochs to perform (--num_training_steps has higher priority)")
     parser.add_argument("--num_warmup_steps", default=0, type=int,
                         help="Linear warmup over warmup_steps.")
@@ -759,7 +711,7 @@ def get_args():
     parser.add_argument('--label_cpt', type=str, default=None)
     parser.add_argument('--label_cpt_lr', type=float, default=1e-3)
     parser.add_argument('--label_cpt_steps', type=int, default=500)
-    parser.add_argument('--label_cpt_bsz', type=int, default=32)
+    parser.add_argument('--label_cpt_bsz', type=int, default=16)
     parser.add_argument('--label_cpt_not_incr_mask_ratio', action='store_true')
     parser.add_argument('--label_cpt_use_bce', action='store_true')
 
@@ -827,188 +779,19 @@ def prepare(args):
     # Before we do anything with models, we want to ensure that we get fp16 execution of torch.einsum if args.fp16 is set.
     # Otherwise it'll default to "promote" mode, and we'll get fp32 operations. Note that running `--fp16_opt_level="O2"` will
     # remove the need for this code, but it is still valid.
-    if args.fp16:
-        try:
-            import apex
-            apex.amp.register_half_function(torch, 'einsum')
-        except ImportError:
-            raise ImportError("Please install apex from https://www.github.com/nvidia/apex to use fp16 training.")
+    # if args.fp16:
+    #     try:
+    #         import apex
+    #         apex.amp.register_half_function(torch, 'einsum')
+    #     except ImportError:
+    #         raise ImportError("Please install apex from https://www.github.com/nvidia/apex to use fp16 training.")
 
-
-def get_model_and_tokenizer(args):
-    config_class, tokenizer_class = MODEL_CLASSES[args.model_type]
-    model_config = config_class.from_pretrained(
-        args.config_name if args.config_name else args.model_name_or_path,
-        cache_dir=args.cache_dir if args.cache_dir else None)
-    config = BertForSeq2SeqConfig.from_exist_config(
-        config=model_config, label_smoothing=args.label_smoothing,
-        fix_word_embedding=args.fix_word_embedding,
-        max_position_embeddings=args.max_source_seq_length + args.max_target_seq_length)
-
-    logging.info("Model config for seq2seq: %s", str(config))
-
-    tokenizer = tokenizer_class.from_pretrained(
-        args.model_name_or_path)
-
-    model_class = \
-        BertForSequenceToSequenceWithPseudoMask if args.mask_way == 'v2' \
-            else BertForSequenceToSequenceUniLMV1
-
-    logging.info("Construct model %s" % model_class.MODEL_NAME)
-
-    model = model_class.from_pretrained(
-        args.model_name_or_path, config=config, model_type=args.model_type,
-        # args.model_name_or_path, config=config, model_type='roberta',
-        reuse_position_embedding=True,
-        cache_dir=args.cache_dir if args.cache_dir else None)
-
-    if args.add_vocab_file:
-        import pickle
-        with open(args.add_vocab_file, 'rb') as f:
-            label_map = pickle.load(f)
-        label_tokens_start_index  = model.bert.embeddings.word_embeddings.num_embeddings
-        labels_key = list(label_map.keys())
-        label_name_tensors = []
-        max_l = -1
-        if args.rcv1_expand:
-            rcv1_label_expand = {}
-            for i in open(args.rcv1_expand):
-                oi = [j for j in i.replace('\n', '').split(' ') if len(j) > 0]
-                rcv1_label_expand[oi[3]] = i.split('child-description: ')[-1].lower().replace('\n', '')
-
-        for lk in labels_key:
-            if args.one_by_one_label_init_map:
-                from collections import defaultdict
-                hiera = defaultdict(set)
-                _label_dict = {}
-                with open(args.one_by_one_label_init_map) as f:
-                    _label_dict['Root'] = -1
-                    for line in f.readlines():
-                        line = line.strip().split('\t')
-                        for i in line[1:]:
-                            if i not in _label_dict:
-                                _label_dict[i] = len(_label_dict) - 1
-                            hiera[line[0]].add(i)
-                    _label_dict.pop('Root')
-
-                r_hiera = {}
-                for i in hiera:
-                    for j in list(hiera[i]):
-                        r_hiera[j] = i
-
-                def _loop(a):
-                    if r_hiera[a] != 'Root':
-                        return [a,] + _loop(r_hiera[a])
-                    else:
-                        return [a]
-
-                one_by_one_label_init_map = {}
-                for i in _label_dict:
-                    one_by_one_label_init_map[i] = '/'.join(_loop(i)[::-1])
-                logging.info(f'map {lk} to {one_by_one_label_init_map[lk]}')
-                label_name_tensors.append(tokenizer.encode(one_by_one_label_init_map[lk], add_special_tokens=False))
-            elif args.nyt_only_last_label_init:
-                logging.info(f'map {lk} to {lk.split("/")[-1]}')
-                label_name_tensors.append(tokenizer.encode(lk.split("/")[-1], add_special_tokens=False))
-            elif args.rcv1_expand:
-                logging.info(f'map {lk} to {rcv1_label_expand[lk]}')
-                label_name_tensors.append(tokenizer.encode(rcv1_label_expand[lk], add_special_tokens=False))
-            else:
-                label_name_tensors.append(tokenizer.encode(lk, add_special_tokens=False))
-            max_l = max(len(label_name_tensors[-1]), max_l)
-        label_name_tensors = torch.LongTensor([i + [tokenizer.pad_token_id] * (max_l - len(i)) for i in label_name_tensors])
-
-        with torch.no_grad():
-            init_label_emb = model.bert.embeddings.word_embeddings(label_name_tensors)
-            label_mask = label_name_tensors != tokenizer.pad_token_id
-            init_label_emb = (label_mask.unsqueeze(-1) * init_label_emb).sum(1)
-        label_tokens = [i for i in range(len(label_map))]
-        #tokenizer.add_tokens([label_map[label] for label in labels_key])
-        for label in labels_key:
-            token = label_map[label]
-            tokenizer.add_tokens([token.lower()])
-        #import pdb;pdb.set_trace()
-        #labels_embeds = torch.nn.Embedding(len(label_tokens), config.hidden_size).weight.data
-        if args.label_cpt:
-            # for compare with same seed
-            rng_state = torch.get_rng_state()
-
-            from collections import defaultdict
-            hiera = defaultdict(set)
-            _label_dict = {}
-            with open(args.label_cpt) as f:
-                _label_dict['Root'] = -1
-                for line in f.readlines():
-                    line = line.strip().split('\t')
-                    for i in line[1:]:
-                        if i not in _label_dict:
-                            _label_dict[i] = len(_label_dict) - 1
-                        hiera[line[0]].add(i)
-                _label_dict.pop('Root')
-            r_hiera = {}
-            for i in hiera:
-                for j in list(hiera[i]):
-                    r_hiera[j] = i
-
-            def _loop(a):
-                if r_hiera[a] != 'Root':
-                    return [a,] + _loop(r_hiera[a])
-                else:
-                    return [a]
-            label_class = {} #每个 labal 的level, root 0
-            for i in _label_dict:
-                label_class[i] = len(_loop(i))
-            # cls l1 l2 l3 sep
-            attention_mask = torch.zeros((len(label_tokens) + 2, len(label_tokens) + 2))
-            num_hiers = defaultdict(set)
-            reversed_hiers = {}
-            for hi in hiera:
-                for hj in list(hiera[hi]):
-                    def _label_map_f(x):
-                        if x == 'Root': return -1
-                        return int(label_map[x].replace('[A_', '').replace(']', ''))
-                    attention_mask[_label_map_f(hi) + 1][_label_map_f(hj) + 1] = 1
-                    num_hiers[_label_map_f(hi) + 1].add(_label_map_f(hj) + 1)
-                    reversed_hiers[_label_map_f(hj) + 1] = _label_map_f(hi) + 1
-                    if args.label_cpt_use_bce:
-                        attention_mask[_label_map_f(hj) + 1][_label_map_f(hi) + 1] = 1
-            input_ids = torch.LongTensor(tokenizer.encode(' '.join(label_map.values()).lower()))
-            assert len(input_ids) == len(labels_key) + 2
-            position_ids = torch.LongTensor([0, ] + [label_class[i] for i in labels_key] + [max(label_class.values()) + 1,])
-
-            init_label_emb = training_cpt(args, tokenizer, input_ids, attention_mask,
-                                            position_ids, init_label_emb, num_hiers, reversed_hiers).detach().cpu()
-
-            # for compare with same seed
-            torch.set_rng_state(rng_state)
-        elif args.random_label_init:
-            rng_state = torch.get_rng_state()
-            init_label_emb = torch.nn.Embedding(len(label_tokens), config.hidden_size).weight.data
-            torch.set_rng_state(rng_state)
-
-        model.bert.embeddings.word_embeddings.weight.data = torch.cat([model.bert.embeddings.word_embeddings.weight.data, init_label_emb], dim=0)
-        model.bert.embeddings.word_embeddings.num_embeddings += len(label_tokens)
-        model.cls.predictions.bias.data =  torch.cat([model.cls.predictions.bias.data, torch.zeros(len(label_tokens))],
-                                                        dim=0)
-        vs = config.vocab_size
-        config.vocab_size = config.vocab_size + len(label_tokens)
-        if args.softmax_label_only:
-            model.label_start_index = label_tokens_start_index
-    else:
-        vs = config.vocab_size
-
-    if args.soft_label:
-        model.soft_label = True
-        model.mask_token_id = tokenizer.mask_token_id
-        model.sep_token_id = tokenizer.sep_token_id
-        model.vs = vs
-
-    return model, tokenizer, vs
 
 def test(args, model_path):
     from test_ztf import main
     bout = None
-    for i, save_path in enumerate([model_path]):
+    for i, save_path in enumerate(model_path):
+        logging.info("start evaluating path:%s", save_path)
         if save_path is None: continue
         flags = ['--model_type'     , args.model_type                          ,
             '--tokenizer_name'         , args.model_name_or_path             ,
@@ -1055,8 +838,7 @@ def test(args, model_path):
 
 
 def main():
-    logging.info("start trainging.....")
-
+    logging.info("start trainging.....")    
     args = get_args()
     prepare(args)
     logging.info(args)
@@ -1108,6 +890,41 @@ def main():
     if args.test_file:
         test(args, save_path)
 
+def test_main(save_path):
+    logging.info("start test.....")
+    args = get_args()
+    prepare(args)
+    logging.info(args)
+    test(args, save_path)
+    
+def get_chkpt_directories(root_dir="/root/autodl-tmp/HBGL/hogan_ztf/roberta_model/"):
+    chkpt_dirs = []
+    
+    # 检查目录是否存在
+    if not os.path.exists(root_dir):
+        print(f"警告: 目录 {root_dir} 不存在")
+        return chkpt_dirs
+    
+    if not os.path.isdir(root_dir):
+        print(f"警告: {root_dir} 不是一个目录")
+        return chkpt_dirs
+    
+    try:
+        # 遍历目录中的所有项
+        for item in os.listdir(root_dir):
+            item_path = os.path.join(root_dir, item)
+            
+            # 检查是否是目录且名称匹配 chkpt-*
+            if os.path.isdir(item_path) and re.match(r'ckpt-.*', item):
+                chkpt_dirs.append(item_path)
+    except PermissionError:
+        print(f"错误: 没有权限访问目录 {root_dir}")
+    except Exception as e:
+        print(f"遍历目录时发生错误: {e}")
+    return chkpt_dirs
 
 if __name__ == "__main__":
     main()
+    save_path = get_chkpt_directories()
+    logging.info(f"找到的检查点目录: {save_path}")
+    test_main(save_path)
