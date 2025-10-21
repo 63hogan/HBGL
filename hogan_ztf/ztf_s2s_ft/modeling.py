@@ -657,11 +657,11 @@ class BertForSequenceToSequenceWithPseudoMask(BertForSequenceToSequence):
         sequence_output = outputs[0]
         pseudo_sequence_output = sequence_output[:, source_len + target_len:, ]
 
-        def loss_mask_and_normalize(loss, mask):
-            mask = mask.type_as(loss)
-            loss = loss * mask
-            denominator = torch.sum(mask) + 1e-5
-            return (loss / denominator).sum()
+        # def loss_mask_and_normalize(loss, mask):
+        #     mask = mask.type_as(loss)
+        #     loss = loss * mask
+        #     denominator = torch.sum(mask) + 1e-5
+        #     return (loss / denominator).sum()
 
         prediction_scores_masked = self.cls(pseudo_sequence_output)
 
@@ -671,8 +671,22 @@ class BertForSequenceToSequenceWithPseudoMask(BertForSequenceToSequence):
         else:
             masked_lm_loss = self.crit_mask_lm(
                 prediction_scores_masked.transpose(1, 2).float(), label_ids)
-        pseudo_lm_loss = loss_mask_and_normalize(
-            masked_lm_loss.float(), target_mask)
+        
+        target_len = label_ids.size(1)
+        device = label_ids.device
+        
+        gamma = 1.2
+        level_indices = torch.arange(0.0, target_len, device=device, dtype=torch.float)
+        level_weights = torch.pow(gamma, level_indices)
+        
+        mask = target_mask.type_as(masked_lm_loss)
+        
+        weighted_loss = masked_lm_loss * level_weights * mask
+        denominator = torch.sum(level_weights * mask) + 1e-5
+        pseudo_lm_loss = torch.sum(weighted_loss) / denominator
+        
+        # pseudo_lm_loss = loss_mask_and_normalize(
+        #     masked_lm_loss.float(), target_mask)
 
         return pseudo_lm_loss
 

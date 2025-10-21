@@ -18,7 +18,8 @@ from transformers import AdamW, get_linear_schedule_with_warmup
 import wandb
 import tqdm
 
-from ztf_s2s_ft.modeling import BertForSequenceToSequenceWithPseudoMask, BertForSequenceToSequenceUniLMV1
+from ztf_s2s_ft.modeling import BertForSequenceToSequenceWithPseudoMask
+
 from transformers import AdamW, get_linear_schedule_with_warmup
 # from transformers import BertConfig, BertTokenizer
 from transformers import \
@@ -198,9 +199,7 @@ def train_label_name_embedding(args):
     tokenizer = tokenizer_class.from_pretrained(
         args.model_name_or_path)
 
-    model_class = \
-        BertForSequenceToSequenceWithPseudoMask if args.mask_way == 'v2' \
-            else BertForSequenceToSequenceUniLMV1
+    model_class = BertForSequenceToSequenceWithPseudoMask 
 
     logging.info("Construct model %s" % model_class.MODEL_NAME)
 
@@ -361,43 +360,6 @@ def prepare_for_training(args, model, checkpoint_state_dict ):
         optimizer.load_state_dict(checkpoint_state_dict['optimizer'])
         model.load_state_dict(checkpoint_state_dict['model'])
 
-    #     # then remove optimizer state to make amp happy
-    #     # https://github.com/NVIDIA/apex/issues/480#issuecomment-587154020
-    #     if amp:
-    #         optimizer.state = {}
-
-    # if amp:
-    #     model, optimizer = amp.initialize(model, optimizer, opt_level=args.fp16_opt_level)
-    #     if checkpoint_state_dict:
-    #         amp.load_state_dict(checkpoint_state_dict['amp'])
-
-    #         # Black Tech from https://github.com/NVIDIA/apex/issues/480#issuecomment-587154020
-    #         # forward, backward, optimizer step, zero_grad
-    #         random_input = {'source_ids': torch.ones(size=(2, 2), device=args.device, dtype=torch.long),
-    #                         'target_ids': torch.ones(size=(2, 2), device=args.device, dtype=torch.long),
-    #                         'label_ids': torch.ones(size=(2, 2), device=args.device, dtype=torch.long),
-    #                         'pseudo_ids': torch.ones(size=(2, 2), device=args.device, dtype=torch.long),
-    #                         'num_source_tokens': torch.zeros(size=(2,), device=args.device, dtype=torch.long),
-    #                         'num_target_tokens': torch.zeros(size=(2,), device=args.device, dtype=torch.long)}
-    #         loss = model(**random_input)
-    #         logging.info("Loss = %f" % loss.cpu().item())
-    #         with amp.scale_loss(loss, optimizer) as scaled_loss:
-    #             scaled_loss.backward()
-    #         optimizer.step()
-    #         model.zero_grad()
-
-    #         # then load optimizer state_dict again (this time without removing optimizer.state)
-    #         optimizer.load_state_dict(checkpoint_state_dict['optimizer'])
-
-    # # multi-gpu training (should be after apex fp16 initialization)
-    # if args.n_gpu > 1:
-    #     model = torch.nn.DataParallel(model)
-
-    # # Distributed training (should be after apex fp16 initialization)
-    # if args.local_rank != -1:
-    #     model = torch.nn.parallel.DistributedDataParallel(
-    #         model, device_ids=[args.local_rank], output_device=args.local_rank, find_unused_parameters=True)
-
     return model, optimizer
 
 
@@ -412,14 +374,6 @@ def train(args, training_features, model, tokenizer):
 
     logging.info(f"TensorBoard 日志将保存在: {tensorboard_logdir}")
     save_path = None
-
-    # if args.fp16:
-    #     try:
-    #         from apex import amp
-    #     except ImportError:
-    #         raise ImportError("Please install apex from https://www.github.com/nvidia/apex to use fp16 training.")
-    # else:
-    #     amp = None
 
     # model recover
     recover_step = utils.get_max_epoch_model(args.output_dir)
@@ -887,8 +841,9 @@ def main():
                 assert j >= vs
 
     save_path = train(args, training_features, model, tokenizer)
-    if args.test_file:
-        test(args, save_path)
+    # if args.test_file:
+    #     test(args, save_path)
+    return args
 
 def test_main(save_path):
     logging.info("start test.....")
@@ -924,7 +879,7 @@ def get_chkpt_directories(root_dir="/root/autodl-tmp/HBGL/hogan_ztf/roberta_mode
     return chkpt_dirs
 
 if __name__ == "__main__":
-    main()
-    save_path = get_chkpt_directories()
+    args = main()
+    save_path = get_chkpt_directories(args.output_dir)
     logging.info(f"找到的检查点目录: {save_path}")
     test_main(save_path)
