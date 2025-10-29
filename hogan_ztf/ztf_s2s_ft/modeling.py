@@ -622,9 +622,15 @@ class BertForSequenceToSequenceWithPseudoMask(BertForSequenceToSequence):
 
         return (true_tokens_mask | pseudo_tokens_mask).type_as(source_mask)
 
+    # def forward(
+    #         self, source_ids, target_ids, label_ids, pseudo_ids, 
+    #         num_source_tokens, num_target_tokens, target_span_ids=None, target_no_offset=None):
     def forward(
             self, source_ids, target_ids, label_ids, pseudo_ids, 
-            num_source_tokens, num_target_tokens, target_span_ids=None, target_no_offset=None):
+            num_source_tokens, num_target_tokens, 
+            root_labels_mask=None,       # 新增参数
+            label_hierarchy_mask=None,   # 新增参数
+            target_span_ids=None, target_no_offset=None):
         source_len = source_ids.size(1)
         target_len = target_ids.size(1)
         pseudo_len = pseudo_ids.size(1)
@@ -664,29 +670,51 @@ class BertForSequenceToSequenceWithPseudoMask(BertForSequenceToSequence):
         #     return (loss / denominator).sum()
 
         prediction_scores_masked = self.cls(pseudo_sequence_output)
+        
+         # --- 层级交叉熵损失计算 ---
+        batch_size, seq_len, num_labels = prediction_scores_masked.shape
+        
+        # 用于存储每个位置计算出的、符合层级约束的损失
+        loss_per_token = torch.zeros_like(label_ids, dtype=torch.float)
 
-        if self.crit_mask_lm_smoothed:
-            masked_lm_loss = self.crit_mask_lm_smoothed(
-                F.log_softmax(prediction_scores_masked.float(), dim=-1), label_ids)
-        else:
-            masked_lm_loss = self.crit_mask_lm(
-                prediction_scores_masked.transpose(1, 2).float(), label_ids)
-        
-        target_len = label_ids.size(1)
-        device = label_ids.device
-        
+        # 1. 处理序列的第一个位置 (level 1)
+        logits_0 = prediction_scores_masked[:, 0, :]
+        labels_0 = label_ids[:, 0]
+        # 将不属于根节点的标签的logit设为负无穷，使其在softmax后概率为0
+        masked_logits_0 = logits_0.masked_fill(root_labels_mask == 1, -1e4)
+        loss_0 = F.cross_entropy(masked_logits_0, labels_0, reduction='none')
+        loss_per_token[:, 0] = loss_0
+
+        # 2. 循环处理后续位置 (level 2 to L)
+        for i in range(1, seq_len):
+            # 获取前一位置的真实标签，作为当前位置的约束
+            prev_labels = label_ids[:, i - 1]
+            
+            # 利用父子关系掩码，为batch中的每个样本找到其合法的子标签集
+            # label_hierarchy_mask[prev_labels] 会利用索引，为每个样本生成一个 [num_labels] 的掩码
+            valid_children_mask = label_hierarchy_mask[prev_labels]
+            
+            logits_i = prediction_scores_masked[:, i, :]
+            labels_i = label_ids[:, i]
+            
+            # 将不属于合法子集的标签的logit设为负无穷
+            masked_logits_i = logits_i.masked_fill(valid_children_mask == 1, -1e4)
+            
+            loss_i = F.cross_entropy(masked_logits_i, labels_i, reduction='none')
+            loss_per_token[:, i] = loss_i
+            
+        # 3. 对计算出的层级损失应用加权和归一化 (与之前方法相同)
         gamma = 1.2
-        level_indices = torch.arange(0.0, target_len, device=device, dtype=torch.float)
+        level_indices = torch.arange(0.0, target_len, device=label_ids.device, dtype=torch.float)
         level_weights = torch.pow(gamma, level_indices)
+        mask = target_mask.type_as(loss_per_token)
         
-        mask = target_mask.type_as(masked_lm_loss)
-        
-        weighted_loss = masked_lm_loss * level_weights * mask
+        weighted_loss = loss_per_token * level_weights * mask
         denominator = torch.sum(level_weights * mask) + 1e-5
+        
         pseudo_lm_loss = torch.sum(weighted_loss) / denominator
         
-        # pseudo_lm_loss = loss_mask_and_normalize(
-        #     masked_lm_loss.float(), target_mask)
+        # ==================== 结构化损失计算结束 ====================
 
         return pseudo_lm_loss
 

@@ -18,3 +18,4 @@ hogan_ztf/tensor_log/*
 *.log
 apex/
 roberta_model/
+hogan_ztf/result/acc_5e-5_10epoch.txt

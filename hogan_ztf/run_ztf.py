@@ -53,6 +53,27 @@ MODEL_CLASSES = {
     'roberta': (RobertaConfig, BertTokenizer),
 }
 
+def create_hierarchy_masks(label_idx_dic, parent_dic, new_vocab_size):
+    """
+    根据标签的层级关系，创建用于约束损失计算的掩码。
+    """
+
+    global_root_mask = torch.ones(new_vocab_size, dtype=torch.bool)
+    global_hierarchy_mask = torch.ones(new_vocab_size, new_vocab_size, dtype=torch.bool)
+
+
+    for label_name, parent_name in parent_dic.items():
+        if parent_name == 'root':
+            label_idx = label_idx_dic.get(label_name)
+            global_root_mask[label_idx] = False # False 表示这是个合法的根节点
+        else:
+            label_idx = label_idx_dic.get(label_name)
+            parent_idx = label_idx_dic.get(parent_name)
+            global_hierarchy_mask[parent_idx][label_idx] = False
+            
+
+    return global_root_mask, global_hierarchy_mask
+
 def train_batch_labels(args, tokenizer, input_ids, attention_mask,  position_ids, _init_label_emb, label_child_set, label_parent_dic):
 
     label_nums = input_ids.shape[0] - 2
@@ -220,11 +241,20 @@ def train_label_name_embedding(args):
         label_idx_dic = get_label_idx(label_name_child_hiera_set)
         
         label_tokens_start_index  = model.bert.embeddings.word_embeddings.num_embeddings
+        new_label_idx_dic = {}
         
         label_tokens = [i for i in range(len(label_idx_dic))]
         for label in sorted(label_idx_dic.keys()):
             token = '__'+ label+ '__'
             tokenizer.add_tokens([token.lower()])
+            new_label_idx_dic[label] = label_tokens_start_index + label_idx_dic[label]
+            logging.info("add label %s start_idx +  label_idx_dic[idx]: %d token idx: %d ", label, new_label_idx_dic[label],  tokenizer.convert_tokens_to_ids(token.lower()))
+        
+        logging.info(f"new vocab size:{tokenizer.vocab_size}")
+         
+        global_root_mask, global_hierarchy_mask = create_hierarchy_masks(
+            new_label_idx_dic, label_name_parent_dic, tokenizer.vocab_size + len(label_idx_dic.keys())
+        )
 
         if args.load_label_embedding_cache and os.path.exists(label_emb_cache_path):
             logging.info("直接从本地加载 label embedding: %s", label_emb_cache_path)
@@ -321,7 +351,7 @@ def train_label_name_embedding(args):
                     )
                     trained_label_emb[batch_original_indices] = updated_batch_emb
                     batch_idx += 1
-                    ##TODO debug
+                    # #TODO debug
                     # if batch_idx > 1:
                     #     break
             
@@ -345,7 +375,7 @@ def train_label_name_embedding(args):
         model.sep_token_id = tokenizer.sep_token_id
         model.vs = vs
 
-    return model, tokenizer, vs
+    return model, tokenizer, vs, global_root_mask, global_hierarchy_mask
 
 def prepare_for_training(args, model, checkpoint_state_dict ):
     no_decay = ['bias', 'LayerNorm.weight']
@@ -363,7 +393,8 @@ def prepare_for_training(args, model, checkpoint_state_dict ):
     return model, optimizer
 
 
-def train(args, training_features, model, tokenizer):
+# def train(args, training_features, model, tokenizer):
+def train(args, training_features, model, tokenizer, root_labels_mask=None, label_hierarchy_mask=None):
     """ Train the model """
     
     
@@ -387,6 +418,12 @@ def train(args, training_features, model, tokenizer):
 
     model.to(args.device)
     model, optimizer = prepare_for_training(args, model, checkpoint_state_dict)
+    
+    
+    if root_labels_mask is not None:
+        root_labels_mask = root_labels_mask.to(args.device)
+    if label_hierarchy_mask is not None:
+        label_hierarchy_mask = label_hierarchy_mask.to(args.device)
 
     scaler = GradScaler(enabled=args.fp16)
     if checkpoint_state_dict and 'scaler' in checkpoint_state_dict:
@@ -466,7 +503,9 @@ def train(args, training_features, model, tokenizer):
                         'label_ids': batch[2],
                         'pseudo_ids': batch[3],
                         'num_source_tokens': batch[4],
-                        'num_target_tokens': batch[5]}
+                        'num_target_tokens': batch[5],
+                        'root_labels_mask': root_labels_mask,          # 新增
+                        'label_hierarchy_mask': label_hierarchy_mask }   # 新增}
             elif args.mask_way == 'v1' or args.mask_way == 'v0':
                 inputs = {'source_ids': batch[0],
                         'target_ids': batch[1],
@@ -474,7 +513,9 @@ def train(args, training_features, model, tokenizer):
                         'masked_pos': batch[3],
                         'masked_weight': batch[4],
                         'num_source_tokens': batch[5],
-                        'num_target_tokens': batch[6]}
+                        'num_target_tokens': batch[6],
+                        'root_labels_mask': root_labels_mask,          # 新增
+                        'label_hierarchy_mask': label_hierarchy_mask }   # 新增}
 
             with autocast(enabled=args.fp16):
                 loss = model(**inputs)
@@ -815,7 +856,8 @@ def main():
     # Load pretrained model and tokenizer
     # train_label_name_embedding(args)
     # return
-    model, tokenizer, vs = train_label_name_embedding(args)
+    # model, tokenizer, vs = train_label_name_embedding(args)
+    model, tokenizer, vs, root_labels_mask, label_hierarchy_mask = train_label_name_embedding(args)
 
     if args.local_rank == 0:
         torch.distributed.barrier()
@@ -840,7 +882,8 @@ def main():
             for j in i.target_ids:
                 assert j >= vs
 
-    save_path = train(args, training_features, model, tokenizer)
+    # save_path = train(args, training_features, model, tokenizer)
+    save_path = train(args, training_features, model, tokenizer, root_labels_mask, label_hierarchy_mask)
     # if args.test_file:
     #     test(args, save_path)
     return args
