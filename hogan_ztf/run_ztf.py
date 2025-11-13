@@ -306,8 +306,8 @@ def train_label_name_embedding(args):
                     trained_label_emb[batch_original_indices] = updated_batch_emb
                     batch_idx += 1
                     #TODO debug
-                    if batch_idx > 1:
-                        break
+                    # if batch_idx > 1:
+                    #     break
             
                 init_label_emb = trained_label_emb.detach().cpu()
                 torch.save(init_label_emb, label_emb_cache_path)
