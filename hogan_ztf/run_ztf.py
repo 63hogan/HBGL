@@ -105,6 +105,8 @@ def train_batch_labels(args, tokenizer, input_ids, attention_mask,  position_ids
                 attention_mask=attention_mask,
                 position_ids=position_ids,
                 inputs_embeds=inputs_embeds,
+                token_type_ids=torch.ones_like(position_ids),
+                
             )
             sequence_output = outputs[0]
             hidden_states = model.cls.predictions.transform(sequence_output)
