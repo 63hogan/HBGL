@@ -10,15 +10,18 @@ import random
 import re
 
 import numpy as np
+
 import torch
 from torch.utils.data import (DataLoader, SequentialSampler)
 from torch.utils.data.distributed import DistributedSampler
 from torch.cuda.amp import GradScaler, autocast
 from transformers import AdamW, get_linear_schedule_with_warmup
+from torch import nn
 import wandb
 import tqdm
 
 from ztf_s2s_ft.modeling import BertForSequenceToSequenceWithPseudoMask
+from ztf_s2s_ft.modeling  import LabelSmoothingLoss
 
 from transformers import AdamW, get_linear_schedule_with_warmup
 # from transformers import BertConfig, BertTokenizer
@@ -210,6 +213,7 @@ def train_label_name_embedding(args):
         for label in sorted(label_idx_dic.keys(),key=label_idx_dic.get):
             token = '__'+ label+ '__'
             tokenizer.add_tokens([token.lower()])
+        
 
         if args.load_label_embedding_cache and os.path.exists(label_emb_cache_path):
             logging.info("直接从本地加载 label embedding: %s", label_emb_cache_path)
@@ -316,20 +320,28 @@ def train_label_name_embedding(args):
         model.bert.embeddings.word_embeddings.num_embeddings += len(label_tokens)
         model.cls.predictions.bias.data =  torch.cat([model.cls.predictions.bias.data, torch.zeros(len(label_tokens))],
                                                         dim=0)
-        vs = config.vocab_size
+        original_vs = config.vocab_size
         config.vocab_size = config.vocab_size + len(label_tokens)
+        logging.info(f"Re-initializing loss function with new vocab size: {config.vocab_size}")
+        if config.label_smoothing > 0:
+            model.crit_mask_lm_smoothed = LabelSmoothingLoss(
+                config.label_smoothing, config.vocab_size, ignore_index=0, reduction='none')
+            model.crit_mask_lm = None
+        else:
+            model.crit_mask_lm_smoothed = None
+            model.crit_mask_lm = nn.CrossEntropyLoss(reduction='none')
         if args.softmax_label_only:
             model.label_start_index = label_tokens_start_index
     else:
-        vs = config.vocab_size
+        original_vs = config.vocab_size
 
-    if args.soft_label:
-        model.soft_label = True
-        model.mask_token_id = tokenizer.mask_token_id
-        model.sep_token_id = tokenizer.sep_token_id
-        model.vs = vs
+    # if args.soft_label:
+    #     model.soft_label = True
+    #     model.mask_token_id = tokenizer.mask_token_id
+    #     model.sep_token_id = tokenizer.sep_token_id
+    #     model.vs = vs
 
-    return model, tokenizer, vs
+    return model, tokenizer, original_vs
 
 def prepare_for_training(args, model, checkpoint_state_dict ):
     no_decay = ['bias', 'LayerNorm.weight']
@@ -582,7 +594,7 @@ def get_args():
                         help="Max gradient norm.")
     parser.add_argument("--num_training_steps", default=-1, type=int,
                         help="set total number of training steps to perform")
-    parser.add_argument("--num_training_epochs", default=20, type=int,
+    parser.add_argument("--num_training_epochs", default=10, type=int,
                         help="set total number of training epochs to perform (--num_training_steps has higher priority)")
     parser.add_argument("--num_warmup_steps", default=0, type=int,
                         help="Linear warmup over warmup_steps.")

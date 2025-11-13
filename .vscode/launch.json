@@ -22,7 +22,7 @@
                 "--valid_file", "/root/autodl-tmp/HBGL/data/ztfData/eval/eval_data_clear_src_tgt_10.jsonl",
                 "--test_file", "/root/autodl-tmp/HBGL/data/ztfData/eval/eval_data_clear_src_tgt_10.jsonl",
                 "--add_vocab_file", "./data/WebOfScience/label_map.pkl",
-                "--label_smoothing", "0",
+                "--label_smoothing", "0.1",
                 // "--wandb",
                 "--learning_rate", "6e-5",
                 "--num_warmup_steps", "500",
