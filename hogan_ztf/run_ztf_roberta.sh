@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 RUN_NAME=$1
 seed=42
-OUTPUT_DIR=/root/autodl-tmp/HBGL/hogan_ztf/roberta_model/lr_6e-5
+OUTPUT_DIR=/root/autodl-tmp/HBGL/hogan_ztf/roberta_model/add_label_self_att_lr_6e-5
 CACHE_DIR=.cache
 TRAIN_FILE=/root/autodl-tmp/HBGL/data/ztfData/train/train_data_clear_src_tgt.jsonl
 
