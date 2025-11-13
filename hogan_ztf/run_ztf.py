@@ -291,6 +291,12 @@ def train_label_name_embedding(args):
                                 batch_label_child_set[parent_batch_idx].add(child_batch_idx)
                                 batch_label_parent_dic[child_batch_idx] = parent_batch_idx
                                 batch_attention_mask[child_batch_idx + 1][parent_batch_idx + 1] = 1
+                    # 自注意力
+                    for i in range(len(batch_labels_keys)):
+                        batch_attention_mask[i + 1, i + 1] = 1 
+                    # [CLS] 和 [SEP] 也应能自注意
+                    batch_attention_mask[0, 0] = 1
+                    batch_attention_mask[-1, -1] = 1
                     
                     batch_label_tokens = ['__'+name+'__' for name in batch_labels_keys]
                     batch_input_ids_str = ' '.join(batch_label_tokens)
