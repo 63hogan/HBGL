@@ -20,3 +20,4 @@ apex/
 roberta_model/
 .DS_Store
 .DS_Store
+hogan_ztf/result/acc_5e-5_10epoch.txt

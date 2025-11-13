@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 RUN_NAME=$1
 seed=42
-OUTPUT_DIR=/root/autodl-tmp/HBGL/hogan_ztf/roberta_model/new_loss
+OUTPUT_DIR=/root/autodl-tmp/HBGL/hogan_ztf/roberta_model/lr_6e-5
 CACHE_DIR=.cache
 TRAIN_FILE=/root/autodl-tmp/HBGL/data/ztfData/train/train_data_clear_src_tgt.jsonl
 
@@ -14,7 +14,7 @@ MODEL_PATH=/root/.cache/huggingface/hub/models--hfl--chinese-roberta-wwm-ext-lar
     --train_file ${TRAIN_FILE} --output_dir ${OUTPUT_DIR}\
     --model_type bert --model_name_or_path  ${MODEL_PATH}\
     --fp16\
-    --do_lower_case --max_source_seq_length 480 --max_target_seq_length 8\
+    --do_lower_case --max_source_seq_length 490 --max_target_seq_length 8\
     --per_gpu_train_batch_size 12 --gradient_accumulation_steps 2\
     --valid_file /root/autodl-tmp/HBGL/data/ztfData/eval/ori_eval_data_src_tgt.jsonl \
     --test_file /root/autodl-tmp/HBGL/data/ztfData/eval/ori_eval_data_src_tgt.jsonl \

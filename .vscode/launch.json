@@ -5,12 +5,12 @@
             "name": "debug_ztf",
             "type": "debugpy", //python
             "request": "launch",
-            "program": "run_ztf.py",
+            "program": "/root/autodl-tmp/HBGL/hogan_ztf/run_ztf.py",
             // "program": "run.py",
             "console": "integratedTerminal",
             "args": [
                 "--train_file", "/root/autodl-tmp/HBGL/data/ztfData/train/train_data_clear_src_tgt.jsonl",
-                "--output_dir", "models/ztf",
+                "--output_dir", "/root/autodl-tmp/HBGL/hogan_ztf/models/debug",
                 "--model_type", "bert",
                 // "--model_name_or_path", "bert-base-uncased",
                 "--model_name_or_path", "/root/.cache/huggingface/hub/models--hfl--chinese-bert-wwm-ext/snapshots/2a995a880017c60e4683869e817130d8af548486",
@@ -24,7 +24,7 @@
                 "--add_vocab_file", "./data/WebOfScience/label_map.pkl",
                 "--label_smoothing", "0",
                 // "--wandb",
-                "--learning_rate", "3e-5",
+                "--learning_rate", "6e-5",
                 "--num_warmup_steps", "500",
                 "--num_training_steps", "2",
                 "--cache_dir", "cache",

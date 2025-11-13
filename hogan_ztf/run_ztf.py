@@ -149,6 +149,10 @@ def train_batch_labels(args, tokenizer, input_ids, attention_mask,  position_ids
             else:
                 loss_fct = CrossEntropyLoss()  # -100 index = padding token
                 masked_lm_loss = loss_fct(prediction_scores.view(-1, label_nums), labels.view(-1))
+        
+        # #DEBUG
+        # if step > 1:
+        #     break
 
         scaler.scale(masked_lm_loss).backward()
         scaler.step(cpt_optimizer)
@@ -301,9 +305,9 @@ def train_label_name_embedding(args):
                     )
                     trained_label_emb[batch_original_indices] = updated_batch_emb
                     batch_idx += 1
-                    ##TODO debug
-                    # if batch_idx > 1:
-                    #     break
+                    #TODO debug
+                    if batch_idx > 1:
+                        break
             
                 init_label_emb = trained_label_emb.detach().cpu()
                 torch.save(init_label_emb, label_emb_cache_path)
@@ -841,7 +845,6 @@ def start_train():
 def test_main(save_path):
     logging.info("start test.....")
     args = get_args()
-    prepare(args)
     logging.info(args)
     test(args, save_path)
     
