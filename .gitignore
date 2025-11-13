@@ -18,3 +18,5 @@ hogan_ztf/tensor_log/*
 *.log
 apex/
 roberta_model/
+.DS_Store
+.DS_Store

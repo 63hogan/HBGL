@@ -42,11 +42,6 @@ FORMAT = '%(asctime)s[%(name)s.%(funcName)s]%(levelname)s: %(message)s'
 
 # 使用 basicConfig 应用格式
 logging.basicConfig(level=logging.INFO, format=FORMAT)
-# # 配置 logging
-# logging.basicConfig(
-#     level=logging.INFO,  # 设置最低记录级别为 DEBUG，所有级别的日志都会显示
-#     format='%(asctime)s - %(levelname)s - [%(module)s:%(lineno)d] - %(message)s' # 设置日志格式
-# )
 
 MODEL_CLASSES = {
     'bert': (BertConfig, BertTokenizer),
@@ -70,13 +65,6 @@ def train_batch_labels(args, tokenizer, input_ids, attention_mask,  position_ids
     cpt_optimizer = AdamW(optimizer_grouped_parameters, lr=args.label_cpt_lr, eps=args.adam_epsilon)
 
     scaler = GradScaler(enabled=args.fp16)
-    # if args.fp16:
-    #     try:
-    #         from apex import amp
-    #     except ImportError:
-    #         raise ImportError("Please install apex from https://www.github.com/nvidia/apex to use fp16 training.")
-    #     # 使用 amp.initialize 包装模型和优化器
-    #     model, cpt_optimizer = amp.initialize(model, cpt_optimizer, opt_level=args.fp16_opt_level)
 
     mask_ratio = 0.15
     bs = args.label_cpt_bsz
@@ -164,19 +152,10 @@ def train_batch_labels(args, tokenizer, input_ids, attention_mask,  position_ids
         scaler.step(cpt_optimizer)
         scaler.update()
         
-        # if args.fp16:
-        #     with amp.scale_loss(masked_lm_loss, cpt_optimizer) as scaled_loss:
-        #         scaled_loss.backward()
-        # else:
-        #     masked_lm_loss.backward()
-        
-        # cpt_optimizer.step()
-        # model.zero_grad()
+
         init_label_emb.grad = None
         logging.info("step %d, masked_lm_loss: %f", step, masked_lm_loss.item())
-        # print(f'step {step}', masked_lm_loss.item())
-        # logging.info(f'step {step}, masked_lm_loss.item()')
-    # torch.save(init_label_emb.cpu(), 'label_name_emb_after_train.pt')
+
     del model
     del cpt_optimizer
     torch.cuda.empty_cache()
@@ -222,7 +201,7 @@ def train_label_name_embedding(args):
         label_tokens_start_index  = model.bert.embeddings.word_embeddings.num_embeddings
         
         label_tokens = [i for i in range(len(label_idx_dic))]
-        for label in sorted(label_idx_dic.keys()):
+        for label in sorted(label_idx_dic.keys(),key=label_idx_dic.get):
             token = '__'+ label+ '__'
             tokenizer.add_tokens([token.lower()])
 
@@ -240,7 +219,7 @@ def train_label_name_embedding(args):
                 assert(label_name_cnt == len(label_idx_dic))
 
 
-                for label_name in label_idx_dic.keys():
+                for label_name in sorted(label_idx_dic.keys(), key=label_idx_dic.get):
                     parents = []
                     l = label_name
                     while label_name_parent_dic[l] != 'root':
@@ -301,8 +280,7 @@ def train_label_name_embedding(args):
                                 batch_attention_mask[parent_batch_idx + 1][child_batch_idx + 1] = 1
                                 batch_label_child_set[parent_batch_idx].add(child_batch_idx)
                                 batch_label_parent_dic[child_batch_idx] = parent_batch_idx
-                                if args.label_cpt_use_bce:
-                                    batch_attention_mask[child_batch_idx + 1][parent_batch_idx + 1] = 1
+                                batch_attention_mask[child_batch_idx + 1][parent_batch_idx + 1] = 1
                     
                     batch_label_tokens = ['__'+name+'__' for name in batch_labels_keys]
                     batch_input_ids_str = ' '.join(batch_label_tokens)
@@ -490,8 +468,7 @@ def train(args, training_features, model, tokenizer):
                 
                 if (global_step + 1) % 50 == 0:
                     logging.info('global_step:%d (loss=%5.3f) lr=%9.7f' % (global_step, loss.item(), scheduler.get_lr()[0]))
-                    # wandb.log({'train/learning_rate': scheduler.get_lr()[0],
-                    #                "train/global_step": step})
+
             else:
                 if (step + 1) % 50 == 0:
                     logging.info('train/loss', loss.item())
@@ -500,11 +477,7 @@ def train(args, training_features, model, tokenizer):
                 loss = loss / args.gradient_accumulation_steps
 
             scaler.scale(loss).backward()
-            # if args.fp16:
-            #     with amp.scale_loss(loss, optimizer) as scaled_loss:
-            #         scaled_loss.backward()
-            # else:
-            #     loss.backward()
+
 
 
             logging_loss += loss.item()
@@ -519,9 +492,6 @@ def train(args, training_features, model, tokenizer):
                 scheduler.step()
                 model.zero_grad()
                 
-                # optimizer.step()
-                # scheduler.step()  # Update learning rate schedule
-                # model.zero_grad()
                 global_step += 1
 
                 if args.local_rank in [-1, 0] and args.logging_steps > 0 and global_step % args.logging_steps == 0:
@@ -555,10 +525,6 @@ def train(args, training_features, model, tokenizer):
 def get_args():
     parser = argparse.ArgumentParser()
 
-    # parser.add_argument("--train_source_file", default=None, type=str, required=True,
-    #                     help="Training data contains source")
-    # parser.add_argument("--train_target_file", default=None, type=str, required=True,
-    #                     help="Training data contains target")
     parser.add_argument("--train_file", default=None, type=str, required=True,
                         help="Training data (json format) for training. Keys: source and target")
     parser.add_argument("--valid_file", default=None, type=str, required=True,
@@ -789,9 +755,34 @@ def test(args, model_path):
         prefix = 'test'
         wandb.log({f'{prefix}/macro_f1': bout['macro_f1'], f'{prefix}/micro_f1': bout['micro_f1']})
 
+def get_chkpt_directories(root_dir="/root/autodl-tmp/HBGL/hogan_ztf/roberta_model/"):
+    chkpt_dirs = []
+    
+    # 检查目录是否存在
+    if not os.path.exists(root_dir):
+        print(f"警告: 目录 {root_dir} 不存在")
+        return chkpt_dirs
+    
+    if not os.path.isdir(root_dir):
+        print(f"警告: {root_dir} 不是一个目录")
+        return chkpt_dirs
+    
+    try:
+        # 遍历目录中的所有项
+        for item in os.listdir(root_dir):
+            item_path = os.path.join(root_dir, item)
+            
+            # 检查是否是目录且名称匹配 chkpt-*
+            if os.path.isdir(item_path) and re.match(r'ckpt-.*', item):
+                chkpt_dirs.append(item_path)
+    except PermissionError:
+        print(f"错误: 没有权限访问目录 {root_dir}")
+    except Exception as e:
+        print(f"遍历目录时发生错误: {e}")
+    return chkpt_dirs
 
 
-def main():
+def start_train():
     logging.info("start trainging.....")    
     args = get_args()
     prepare(args)
@@ -852,34 +843,13 @@ def test_main(save_path):
     logging.info(args)
     test(args, save_path)
     
-def get_chkpt_directories(root_dir="/root/autodl-tmp/HBGL/hogan_ztf/roberta_model/"):
-    chkpt_dirs = []
-    
-    # 检查目录是否存在
-    if not os.path.exists(root_dir):
-        print(f"警告: 目录 {root_dir} 不存在")
-        return chkpt_dirs
-    
-    if not os.path.isdir(root_dir):
-        print(f"警告: {root_dir} 不是一个目录")
-        return chkpt_dirs
-    
-    try:
-        # 遍历目录中的所有项
-        for item in os.listdir(root_dir):
-            item_path = os.path.join(root_dir, item)
-            
-            # 检查是否是目录且名称匹配 chkpt-*
-            if os.path.isdir(item_path) and re.match(r'ckpt-.*', item):
-                chkpt_dirs.append(item_path)
-    except PermissionError:
-        print(f"错误: 没有权限访问目录 {root_dir}")
-    except Exception as e:
-        print(f"遍历目录时发生错误: {e}")
-    return chkpt_dirs
 
-if __name__ == "__main__":
-    args = main()
+
+def main():
+    args = start_train()
     save_path = get_chkpt_directories(args.output_dir)
     logging.info(f"找到的检查点目录: {save_path}")
     test_main(save_path)
+
+if __name__ == "__main__":
+    main()
