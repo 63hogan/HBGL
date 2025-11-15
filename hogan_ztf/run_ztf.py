@@ -317,8 +317,8 @@ def train_label_name_embedding(args):
                     # batch_position_ids = torch.LongTensor([0] + batch_label_classes + [0])
                     batch_label_classes = [label_level_dic[name]-1 for name in batch_labels_keys]
                     max_level_in_batch = max(batch_label_classes) if batch_label_classes else 0
-                    batch_position_ids = torch.LongTensor([-1] + batch_label_classes + [-1])
-                    batch_position_ids = torch.zeros_like(batch_position_ids)
+                    batch_hier_pos_ids = torch.LongTensor([-1] + batch_label_classes + [-1])
+                    batch_position_ids = torch.zeros_like(batch_hier_pos_ids)
 
                     
                     

@@ -180,7 +180,7 @@ def main(flags=None):
         label_name_set = get_uniq_train_cls_from_json(args.train_data_path)
         label_name_child_hiera_set, _ = get_train_labels_hiera_info(label_name_set,ztf_map)
         label_idx_dic = get_label_idx(label_name_child_hiera_set)
-        for label in sorted(label_idx_dic.keys()):
+        for label in sorted(label_idx_dic.keys(),key=label_idx_dic.get):
             token = '__'+ label+ '__'
             tokenizer.add_tokens([token.lower()])
         add_token_num = len(label_idx_dic)

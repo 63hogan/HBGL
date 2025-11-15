@@ -118,6 +118,7 @@ class Preprocess4Seq2seqDecoder(Pipeline):
                 + [self.target_type_id] * (max_len_in_batch - len(padded_tokens_a))
 
         mask_qkv = None
+        
 
         position_ids = []
         hier_target_position_ids = []
@@ -130,7 +131,6 @@ class Preprocess4Seq2seqDecoder(Pipeline):
         for i in range(max_a_len + self.delta, max_len_in_batch):
             position_ids.append(i - (max_a_len + self.delta) + len(tokens_a) + self.delta)
             hier_target_position_ids.append(i-(max_a_len + self.delta))
-
         # Token Indexing
         input_ids = self.indexer(tokens)
 
