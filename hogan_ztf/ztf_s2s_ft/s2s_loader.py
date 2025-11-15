@@ -120,12 +120,16 @@ class Preprocess4Seq2seqDecoder(Pipeline):
         mask_qkv = None
 
         position_ids = []
+        hier_target_position_ids = []
         for i in range(len(tokens_a) + self.delta):
             position_ids.append(i)
+            hier_target_position_ids.append(-1)
         for i in range(len(tokens_a) + self.delta, max_a_len + self.delta):
             position_ids.append(0)
+            hier_target_position_ids.append(-1)
         for i in range(max_a_len + self.delta, max_len_in_batch):
             position_ids.append(i - (max_a_len + self.delta) + len(tokens_a) + self.delta)
+            hier_target_position_ids.append(i-(max_a_len + self.delta))
 
         # Token Indexing
         input_ids = self.indexer(tokens)
@@ -152,4 +156,4 @@ class Preprocess4Seq2seqDecoder(Pipeline):
         input_mask[second_st:second_end, second_st:second_end].copy_(
             self._tril_matrix[:second_end-second_st, :second_end-second_st])
 
-        return (input_ids, segment_ids, position_ids, input_mask, mask_qkv, self.task_idx)
+        return (input_ids, segment_ids, position_ids, input_mask, mask_qkv, self.task_idx,hier_target_position_ids)

@@ -277,13 +277,30 @@ class BertEmbeddings(nn.Module):
             self.num_pos_emb = 1
         self.position_embeddings = nn.Embedding(
             config.max_position_embeddings, config.hidden_size * self.num_pos_emb)
+        
+                
+        ##### Change1 ADD hier postion embedding  ##### 
+        hier_max_depth = getattr(config, "hier_max_depth", None)
+        if hier_max_depth is None:
+            hier_max_depth = 3
+            config.hier_max_depth = hier_max_depth
+        self.hier_max_depth = hier_max_depth
+
+        if self.hier_max_depth > 0:
+            # index: [0, hier_max_depth-1] 对应不同层级
+            self.hier_position_embeddings = nn.Embedding(self.hier_max_depth, config.hidden_size)
+        else:
+            self.hier_position_embeddings = None
+        ##### Change1 ADD hier postion embedding  ##### 
 
         # self.LayerNorm is not snake-cased to stick with TensorFlow model variable name and be able to load
         # any TensorFlow checkpoint file
         self.LayerNorm = BertLayerNorm(config.hidden_size, eps=1e-5)
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
 
-    def forward(self, input_ids, token_type_ids=None, position_ids=None, task_idx=None):
+    def forward(self, input_ids, token_type_ids=None, position_ids=None, task_idx=None,
+                hier_position_ids=None,   # 新增：层级位置 id
+                ):
         seq_length = input_ids.size(1)
         if position_ids is None:
             position_ids = torch.arange(
@@ -295,6 +312,26 @@ class BertEmbeddings(nn.Module):
         words_embeddings = self.word_embeddings(input_ids)
         position_embeddings = self.position_embeddings(position_ids)
 
+                ##### Change1 ADD hier postion embedding  ##### 
+        # ===== 用层级位置编码覆盖 label 段的位置编码 =====
+        # 约定：hier_position_ids 与 input_ids 形状一致，
+        #       -1 表示“不用层级 embedding，保留原始位置编码”
+        if hier_position_ids is not None and self.hier_position_embeddings is not None:
+            # 只在 hier_position_ids >= 0 的位置用层级编码
+            hier_mask = (hier_position_ids >= 0)  # [B, L]
+            if hier_mask.any():
+                # 防止负数索引
+                safe_hier_ids = hier_position_ids.clamp(min=0, max=self.hier_max_depth - 1)
+                hier_pos_emb = self.hier_position_embeddings(safe_hier_ids)  # [B, L, H]
+
+                # where: mask 为 True 的位置用层级 embedding 替换
+                position_embeddings = torch.where(
+                    hier_mask.unsqueeze(-1),  # [B, L, 1]
+                    hier_pos_emb,
+                    position_embeddings,
+                )
+        ##### Change1 ADD hier postion embedding  ##### 
+        
         if self.num_pos_emb > 1:
             num_batch = position_embeddings.size(0)
             num_pos = position_embeddings.size(1)
@@ -909,12 +946,16 @@ class BertModel(PreTrainedBertModel):
         return extended_attention_mask
 
     def forward(self, input_ids, token_type_ids=None, attention_mask=None, output_all_encoded_layers=True,
-                mask_qkv=None, task_idx=None, key_history=None, value_history=None, position_ids=None):
+                mask_qkv=None, task_idx=None, key_history=None, value_history=None, position_ids=None,
+                hier_position_ids=None,   # 新增参数
+                ):
         extended_attention_mask = self.get_extended_attention_mask(
             input_ids, token_type_ids, attention_mask)
 
         embedding_output = self.embeddings(
-            input_ids, token_type_ids, task_idx=task_idx, position_ids=position_ids)
+            input_ids, token_type_ids, task_idx=task_idx, position_ids=position_ids,
+            hier_position_ids=hier_position_ids,   # 新增参数
+            )
         encoded_layers = self.encoder(embedding_output, extended_attention_mask,
                                       output_all_encoded_layers=output_all_encoded_layers,
                                       mask_qkv=mask_qkv, seg_ids=token_type_ids,
@@ -936,12 +977,14 @@ class BertModelIncr(BertModel):
             self.rel_pos_bias = None
 
     def forward(self, input_ids, token_type_ids, position_ids, attention_mask, output_all_encoded_layers=True,
-                prev_embedding=None, prev_encoded_layers=None, mask_qkv=None, task_idx=None, rel_pos=None):
+                prev_embedding=None, prev_encoded_layers=None, mask_qkv=None, task_idx=None, rel_pos=None,
+                hier_position_ids=None
+                ):
         extended_attention_mask = self.get_extended_attention_mask(
             input_ids, token_type_ids, attention_mask)
 
         embedding_output = self.embeddings(
-            input_ids, token_type_ids, position_ids, task_idx=task_idx)
+            input_ids, token_type_ids, position_ids, task_idx=task_idx,hier_position_ids=hier_position_ids,)
 
         if self.rel_pos_bias is not None:
             # print("Rel pos size = %s" % str(rel_pos.size()))
@@ -1140,7 +1183,9 @@ class BertForSeq2SeqDecoder(PreTrainedBertModel):
 
         self.div_func = get_div_func()
 
-    def forward(self, input_ids, token_type_ids, position_ids, attention_mask, task_idx=None, mask_qkv=None):
+    def forward(self, input_ids, token_type_ids, position_ids, attention_mask, task_idx=None, mask_qkv=None,
+                 hier_position_ids=None,
+                ):
         if self.search_beam_size > 1:
             return self.beam_search(input_ids, token_type_ids, position_ids, attention_mask,
                                     task_idx=task_idx, mask_qkv=mask_qkv)
@@ -1186,6 +1231,15 @@ class BertForSeq2SeqDecoder(PreTrainedBertModel):
                                   start_pos:next_pos + 1, :next_pos + 1]
             curr_position_ids = position_ids[:, start_pos:next_pos + 1]
 
+
+            # ---- 新增：当前窗口的层级位置编码 ----
+            if hier_position_ids is not None:
+                curr_hier_position_ids = hier_position_ids[:, start_pos:next_pos + 1]
+            else:
+                curr_hier_position_ids = None
+            # --------------------------------
+            
+            
             if rel_pos is not None:
                 cur_rel_pos = rel_pos[:, start_pos:next_pos + 1, :next_pos + 1]
             else:
@@ -1194,7 +1248,9 @@ class BertForSeq2SeqDecoder(PreTrainedBertModel):
             new_embedding, new_encoded_layers, _ = \
                 self.bert(x_input_ids, curr_token_type_ids, curr_position_ids, curr_attention_mask,
                           output_all_encoded_layers=True, prev_embedding=prev_embedding,
-                          prev_encoded_layers=prev_encoded_layers, mask_qkv=mask_qkv, rel_pos=cur_rel_pos)
+                          prev_encoded_layers=prev_encoded_layers, mask_qkv=mask_qkv, rel_pos=cur_rel_pos,
+                          hier_position_ids=curr_hier_position_ids,  # ★ 传入层级位置编码
+            )
 
             last_hidden = new_encoded_layers[-1][:, -1:, :]
             prediction_scores, _ = self.cls(

@@ -175,13 +175,28 @@ class BertEmbeddings(nn.Module):
             self.token_type_embeddings = nn.Embedding(config.type_vocab_size, config.hidden_size)
         else:
             self.token_type_embeddings = None
+        
+        ##### Change1 ADD hier postion embedding  ##### 
+        hier_max_depth = getattr(config, "hier_max_depth", None)
+        if hier_max_depth is None:
+            hier_max_depth = 10
+            config.hier_max_depth = hier_max_depth
+        self.hier_max_depth = hier_max_depth
+
+        if self.hier_max_depth > 0:
+            # index: [0, hier_max_depth-1] 对应不同层级
+            self.hier_position_embeddings = nn.Embedding(self.hier_max_depth, config.hidden_size)
+        else:
+            self.hier_position_embeddings = None
+        ##### Change1 ADD hier postion embedding  ##### 
 
         # self.LayerNorm is not snake-cased to stick with TensorFlow model variable name and be able to load
         # any TensorFlow checkpoint file
         self.LayerNorm = BertLayerNorm(config.hidden_size, eps=config.layer_norm_eps)
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
 
-    def forward(self, input_ids=None, token_type_ids=None, position_ids=None, inputs_embeds=None):
+    def forward(self, input_ids=None, token_type_ids=None, position_ids=None, inputs_embeds=None, hier_position_ids=None,   # 新增：层级位置 id
+                ):
         if input_ids is not None:
             input_shape = input_ids.size()
         else:
@@ -198,6 +213,26 @@ class BertEmbeddings(nn.Module):
         if inputs_embeds is None:
             inputs_embeds = self.word_embeddings(input_ids)
         position_embeddings = self.position_embeddings(position_ids)
+        
+        ##### Change1 ADD hier postion embedding  ##### 
+        # ===== 用层级位置编码覆盖 label 段的位置编码 =====
+        # 约定：hier_position_ids 与 input_ids 形状一致，
+        #       -1 表示“不用层级 embedding，保留原始位置编码”
+        if hier_position_ids is not None and self.hier_position_embeddings is not None:
+            # 只在 hier_position_ids >= 0 的位置用层级编码
+            hier_mask = (hier_position_ids >= 0)  # [B, L]
+            if hier_mask.any():
+                # 防止负数索引
+                safe_hier_ids = hier_position_ids.clamp(min=0, max=self.hier_max_depth - 1)
+                hier_pos_emb = self.hier_position_embeddings(safe_hier_ids)  # [B, L, H]
+
+                # where: mask 为 True 的位置用层级 embedding 替换
+                position_embeddings = torch.where(
+                    hier_mask.unsqueeze(-1),  # [B, L, 1]
+                    hier_pos_emb,
+                    position_embeddings,
+                )
+        ##### Change1 ADD hier postion embedding  ##### 
 
         embeddings = inputs_embeds + position_embeddings
 
@@ -450,7 +485,9 @@ class BertModel(BertPreTrainedForSeq2SeqModel):
             self.rel_pos_bias = None
 
     def forward(self, input_ids=None, attention_mask=None, token_type_ids=None,
-                position_ids=None, inputs_embeds=None, split_lengths=None):
+                position_ids=None, inputs_embeds=None, split_lengths=None,
+                hier_position_ids=None,   # 新增参数
+                ):
         if input_ids is not None and inputs_embeds is not None:
             raise ValueError("You cannot specify both input_ids and inputs_embeds at the same time")
         elif input_ids is not None:
@@ -485,7 +522,9 @@ class BertModel(BertPreTrainedForSeq2SeqModel):
         extended_attention_mask = (1.0 - extended_attention_mask) * -10000.0
 
         embedding_output, position_ids = self.embeddings(
-            input_ids=input_ids, position_ids=position_ids, token_type_ids=token_type_ids, inputs_embeds=inputs_embeds)
+            input_ids=input_ids, position_ids=position_ids, token_type_ids=token_type_ids, inputs_embeds=inputs_embeds,
+            hier_position_ids=hier_position_ids,#新增参数
+            )
         if self.config.rel_pos_bins > 0:
             rel_pos_mat = position_ids.unsqueeze(-2) - position_ids.unsqueeze(-1)
             rel_pos = relative_position_bucket(
@@ -650,9 +689,39 @@ class BertForSequenceToSequenceWithPseudoMask(BertForSequenceToSequence):
             target_span_ids = target_position_ids
         attention_mask = self.create_attention_mask(source_mask, target_mask, source_position_ids, target_span_ids)
 
+        ##### Change1 ADD hier postion embedding  ##### 
+        hier_position_ids = None
+        if hasattr(self.bert, "embeddings") and self.bert.embeddings.hier_position_embeddings is not None:
+            batch_size = target_ids.size(0)
+            device = target_ids.device
+            max_depth = self.bert.embeddings.hier_max_depth
+            base_levels = torch.arange(target_len, dtype=torch.long, device=device)
+            base_levels = base_levels.clamp(max=max_depth - 1)
+            base_levels = base_levels.unsqueeze(0).expand(batch_size, -1)  # [B, T]
+            
+            hier_target_position_ids = target_position_ids.new_full(target_position_ids.size(), -1) #形状相同，初始化-1
+            hier_pseudo_position_ids = target_position_ids.new_full(target_position_ids.size(), -1)
+            
+            hier_source_position_ids = source_position_ids.new_full(source_position_ids.size(), -1)
+            hier_target_position_ids = base_levels.clone()
+            hier_pseudo_position_ids = base_levels.clone()
+            
+            # [source | target | pseudo]
+            hier_position_ids = torch.cat(
+                (hier_source_position_ids, hier_target_position_ids, hier_pseudo_position_ids),
+                dim=1,
+            )
+        
+        
+        ##### Change1 ADD hier postion embedding  ##### 
+
+
+
         outputs = self.bert(
             input_ids, attention_mask=attention_mask, token_type_ids=token_type_ids,
-            position_ids=position_ids, split_lengths=split_lengths)
+            position_ids=position_ids, split_lengths=split_lengths,
+            hier_position_ids=hier_position_ids,
+            )
 
         sequence_output = outputs[0]
         pseudo_sequence_output = sequence_output[:, source_len + target_len:, ]

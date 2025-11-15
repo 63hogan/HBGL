@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 RUN_NAME=$1
 seed=42
-OUTPUT_DIR=/root/autodl-tmp/HBGL/hogan_ztf/roberta_model/add_label_self_att_lr_6e-5
+OUTPUT_DIR=/root/autodl-tmp/HBGL/hogan_ztf/roberta_model/hier_pos_lr_7e-5
 CACHE_DIR=.cache
 TRAIN_FILE=/root/autodl-tmp/HBGL/data/ztfData/train/train_data_clear_src_tgt.jsonl
 
@@ -21,7 +21,7 @@ MODEL_PATH=/root/.cache/huggingface/hub/models--hfl--chinese-roberta-wwm-ext-lar
     --add_vocab_file ./data/WebOfScience/label_map.pkl \
     --label_smoothing 0.1\
     --save_steps 550 \
-    --learning_rate 6e-5 --num_warmup_steps 500 --num_training_steps -1 --cache_dir ${CACHE_DIR}\
+    --learning_rate 7e-5 --num_warmup_steps 500 --num_training_steps -1 --cache_dir ${CACHE_DIR}\
     --soft_label --seed ${seed} \
     --label_cpt ./data/WebOfScience/wos.taxnomy --label_cpt_not_incr_mask_ratio --label_cpt_steps 300 --label_cpt_use_bce \
     --load_label_embedding_cache    ; /usr/bin/shutdown

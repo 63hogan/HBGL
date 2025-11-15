@@ -20,7 +20,7 @@ from torch import nn
 import wandb
 import tqdm
 
-from ztf_s2s_ft.modeling import BertForSequenceToSequenceWithPseudoMask
+from ztf_s2s_ft.modeling import BertForSequenceToSequenceWithPseudoMask,BertForSequenceToSequence
 from ztf_s2s_ft.modeling  import LabelSmoothingLoss
 
 from transformers import AdamW, get_linear_schedule_with_warmup
@@ -51,19 +51,20 @@ MODEL_CLASSES = {
     'roberta': (RobertaConfig, BertTokenizer),
 }
 
-def train_batch_labels(args, tokenizer, input_ids, attention_mask,  position_ids, _init_label_emb, label_child_set, label_parent_dic):
+def train_batch_labels(args, tokenizer, input_ids, attention_mask,  position_ids, _init_label_emb, label_child_set, label_parent_dic, hier_pos_id, hier_pos_emb):
 
     label_nums = input_ids.shape[0] - 2
 
-    model = BertForMaskedLM.from_pretrained(args.model_name_or_path)
+    model = BertForSequenceToSequence.from_pretrained(args.model_name_or_path)
     model = model.train()
     model.cuda()
-
+    
     init_label_emb = _init_label_emb.float().cuda().requires_grad_()
-    # torch.save(init_label_emb.cpu(), 'label_name_emb_before_train.pt')
+    hier_position_emb = hier_pos_emb.float().cuda().requires_grad_()
 
     optimizer_grouped_parameters = [
-        {'params': [init_label_emb, ], 'weight_decay': 0.0}
+        {'params': [init_label_emb, ], 'weight_decay': 0.0},
+        {"params": [hier_position_emb], "weight_decay": 0.0}
     ]
     cpt_optimizer = AdamW(optimizer_grouped_parameters, lr=args.label_cpt_lr, eps=args.adam_epsilon)
 
@@ -73,6 +74,7 @@ def train_batch_labels(args, tokenizer, input_ids, attention_mask,  position_ids
     bs = args.label_cpt_bsz
     b_input_ids = input_ids.unsqueeze(0).repeat(bs, 1).cuda().long()
     position_ids = position_ids.unsqueeze(0).repeat(bs, 1).cuda().long()
+    hier_position_ids = hier_pos_id.unsqueeze(0).repeat(bs, 1).cuda().long()
     attention_mask = attention_mask.unsqueeze(0).repeat(bs, 1, 1).cuda().long()
     
     
@@ -109,6 +111,7 @@ def train_batch_labels(args, tokenizer, input_ids, attention_mask,  position_ids
                 position_ids=position_ids,
                 inputs_embeds=inputs_embeds,
                 token_type_ids=torch.ones_like(position_ids),
+                hier_position_ids=hier_position_ids,
                 
             )
             sequence_output = outputs[0]
@@ -153,9 +156,9 @@ def train_batch_labels(args, tokenizer, input_ids, attention_mask,  position_ids
                 loss_fct = CrossEntropyLoss()  # -100 index = padding token
                 masked_lm_loss = loss_fct(prediction_scores.view(-1, label_nums), labels.view(-1))
         
-        # #DEBUG
-        # if step > 1:
-        #     break
+        #DEBUG
+        if step > 2:
+            break
 
         scaler.scale(masked_lm_loss).backward()
         scaler.step(cpt_optimizer)
@@ -169,7 +172,7 @@ def train_batch_labels(args, tokenizer, input_ids, attention_mask,  position_ids
     del cpt_optimizer
     torch.cuda.empty_cache()
     
-    return init_label_emb.detach().cpu()
+    return init_label_emb.detach().cpu(), hier_position_emb.detach().cpu()
 
 
 def train_label_name_embedding(args):
@@ -198,6 +201,7 @@ def train_label_name_embedding(args):
         cache_dir=args.cache_dir if args.cache_dir else None)
 
     label_emb_cache_path = args.output_dir + '/label_name_emb_after_train.pt'
+    hier_pos_emb_cache_path = args.output_dir + '/hier_pos_emb_after_train.pt'
     
     if args.add_vocab_file:
         init_label_emb = None
@@ -213,11 +217,15 @@ def train_label_name_embedding(args):
         for label in sorted(label_idx_dic.keys(),key=label_idx_dic.get):
             token = '__'+ label+ '__'
             tokenizer.add_tokens([token.lower()])
+            
+            hier_pos_emb = nn.Embedding(10, model.config.hidden_size)
+            hier_pos_emb = nn.init.xavier_uniform_(hier_pos_emb.weight)
         
 
         if args.load_label_embedding_cache and os.path.exists(label_emb_cache_path):
             logging.info("直接从本地加载 label embedding: %s", label_emb_cache_path)
             init_label_emb = torch.load(label_emb_cache_path)
+            hier_pos_emb = torch.loar(get_ztf_hierarchy_info)
         else:
                             
             if args.label_cpt:
@@ -304,26 +312,35 @@ def train_label_name_embedding(args):
                     batch_input_ids = torch.LongTensor([tokenizer.cls_token_id] + encoded_tokens + [tokenizer.sep_token_id])
                     
                     assert len(batch_input_ids) == len(batch_labels_keys) + 2
-                    batch_label_classes = [label_level_dic[name] for name in batch_labels_keys]
+                    # batch_label_classes = [label_level_dic[name] for name in batch_labels_keys]
+                    # max_level_in_batch = max(batch_label_classes) if batch_label_classes else 0
+                    # batch_position_ids = torch.LongTensor([0] + batch_label_classes + [0])
+                    batch_label_classes = [label_level_dic[name]-1 for name in batch_labels_keys]
                     max_level_in_batch = max(batch_label_classes) if batch_label_classes else 0
-                    batch_position_ids = torch.LongTensor([0] + batch_label_classes + [max_level_in_batch + 1])
+                    batch_position_ids = torch.LongTensor([-1] + batch_label_classes + [-1])
+                    batch_position_ids = torch.zeros_like(batch_position_ids)
+
                     
-                    updated_batch_emb = train_batch_labels(
+                    
+                    updated_batch_emb, hier_pos_emb = train_batch_labels(
                         args, tokenizer, batch_input_ids, batch_attention_mask,
                         batch_position_ids, batch_init_label_emb, 
-                        batch_label_child_set, batch_label_parent_dic
+                        batch_label_child_set, batch_label_parent_dic,batch_position_ids,hier_pos_emb
                     )
                     trained_label_emb[batch_original_indices] = updated_batch_emb
                     batch_idx += 1
-                    #TODO debug
-                    # if batch_idx > 1:
-                    #     break
+                    # TODO debug
+                    if batch_idx > 1:
+                        break
             
                 init_label_emb = trained_label_emb.detach().cpu()
+                hier_pos_emb = hier_pos_emb.detach().cpu()
                 torch.save(init_label_emb, label_emb_cache_path)
+                torch.save(hier_pos_emb, hier_pos_emb_cache_path)
         
         model.bert.embeddings.word_embeddings.weight.data = torch.cat([model.bert.embeddings.word_embeddings.weight.data, init_label_emb], dim=0)
         model.bert.embeddings.word_embeddings.num_embeddings += len(label_tokens)
+        model.bert.embeddings.hier_position_embeddings = hier_pos_emb
         model.cls.predictions.bias.data =  torch.cat([model.cls.predictions.bias.data, torch.zeros(len(label_tokens))],
                                                         dim=0)
         original_vs = config.vocab_size
@@ -600,7 +617,7 @@ def get_args():
                         help="Max gradient norm.")
     parser.add_argument("--num_training_steps", default=-1, type=int,
                         help="set total number of training steps to perform")
-    parser.add_argument("--num_training_epochs", default=10, type=int,
+    parser.add_argument("--num_training_epochs", default=20, type=int,
                         help="set total number of training epochs to perform (--num_training_steps has higher priority)")
     parser.add_argument("--num_warmup_steps", default=0, type=int,
                         help="Linear warmup over warmup_steps.")
