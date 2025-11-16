@@ -51,20 +51,55 @@ MODEL_CLASSES = {
     'roberta': (RobertaConfig, BertTokenizer),
 }
 
-def train_batch_labels(args, tokenizer, input_ids, attention_mask,  position_ids, _init_label_emb, label_child_set, label_parent_dic, hier_pos_id, hier_pos_emb):
+def train_batch_labels(args, tokenizer, input_ids, attention_mask,  position_ids, _init_label_emb, label_child_set, label_parent_dic, hier_pos_id, hier_pos_emb_weight):
+
+    
+    config_class, tokenizer_class = MODEL_CLASSES[args.model_type]
+    model_config = config_class.from_pretrained(
+        args.config_name if args.config_name else args.model_name_or_path,
+        cache_dir=args.cache_dir if args.cache_dir else None)
+    config = BertForSeq2SeqConfig.from_exist_config(
+        config=model_config, label_smoothing=args.label_smoothing,
+        fix_word_embedding=args.fix_word_embedding,
+        max_position_embeddings=args.max_source_seq_length + args.max_target_seq_length)
+
+    logging.info("Model config for seq2seq: %s", str(config))
+
+    tokenizer = tokenizer_class.from_pretrained(
+        args.model_name_or_path)
+
+    model_class = BertForSequenceToSequence 
+
+    logging.info("Construct model %s" % model_class.MODEL_NAME)
+
+    model = model_class.from_pretrained(
+        args.model_name_or_path, config=config, model_type=args.model_type,
+        # args.model_name_or_path, config=config, model_type='roberta',
+        reuse_position_embedding=True,
+        cache_dir=args.cache_dir if args.cache_dir else None)
+    
+    
 
     label_nums = input_ids.shape[0] - 2
 
-    model = BertForSequenceToSequence.from_pretrained(args.model_name_or_path)
+    # model = BertForSequenceToSequence.from_pretrained(args.model_name_or_path)
     model = model.train()
     model.cuda()
     
+    device = next(model.parameters()).device
+    
     init_label_emb = _init_label_emb.float().cuda().requires_grad_()
-    hier_position_emb = hier_pos_emb.float().cuda().requires_grad_()
+    
+    # hier_position_emb = hier_pos_emb.float().cuda().requires_grad_()
+
+    hier_pos_emb_weight = hier_pos_emb_weight.to(device)
+    # model.bert.embeddings.hier_position_embeddings = hier_position_emb
+    model.bert.embeddings.hier_position_embeddings.weight.data = hier_pos_emb_weight
+    model.bert.embeddings.hier_position_embeddings.weight.requires_grad_(True)
 
     optimizer_grouped_parameters = [
         {'params': [init_label_emb, ], 'weight_decay': 0.0},
-        {"params": [hier_position_emb], "weight_decay": 0.0}
+        {"params": [model.bert.embeddings.hier_position_embeddings.weight], "weight_decay": 0.0}
     ]
     cpt_optimizer = AdamW(optimizer_grouped_parameters, lr=args.label_cpt_lr, eps=args.adam_epsilon)
 
@@ -156,9 +191,9 @@ def train_batch_labels(args, tokenizer, input_ids, attention_mask,  position_ids
                 loss_fct = CrossEntropyLoss()  # -100 index = padding token
                 masked_lm_loss = loss_fct(prediction_scores.view(-1, label_nums), labels.view(-1))
         
-        #DEBUG
-        if step > 2:
-            break
+        # #DEBUG
+        # if step > 2:
+        #     break
 
         scaler.scale(masked_lm_loss).backward()
         scaler.step(cpt_optimizer)
@@ -167,12 +202,12 @@ def train_batch_labels(args, tokenizer, input_ids, attention_mask,  position_ids
 
         init_label_emb.grad = None
         logging.info("step %d, masked_lm_loss: %f", step, masked_lm_loss.item())
-
+    hier_pos_emb_weight = model.bert.embeddings.hier_position_embeddings.weight.data.clone().detach().cpu()
     del model
     del cpt_optimizer
     torch.cuda.empty_cache()
     
-    return init_label_emb.detach().cpu(), hier_position_emb.detach().cpu()
+    return init_label_emb.detach().cpu(), hier_pos_emb_weight
 
 
 def train_label_name_embedding(args):
@@ -218,14 +253,14 @@ def train_label_name_embedding(args):
             token = '__'+ label+ '__'
             tokenizer.add_tokens([token.lower()])
             
-            hier_pos_emb = nn.Embedding(10, model.config.hidden_size)
-            hier_pos_emb = nn.init.xavier_uniform_(hier_pos_emb.weight)
+        hier_pos_emb = nn.Embedding(10, model.config.hidden_size)
+        nn.init.xavier_uniform_(hier_pos_emb.weight)
         
 
         if args.load_label_embedding_cache and os.path.exists(label_emb_cache_path):
             logging.info("直接从本地加载 label embedding: %s", label_emb_cache_path)
             init_label_emb = torch.load(label_emb_cache_path)
-            hier_pos_emb = torch.loar(get_ztf_hierarchy_info)
+            hier_pos_emb = torch.load(hier_pos_emb_cache_path)
         else:
                             
             if args.label_cpt:
@@ -320,21 +355,21 @@ def train_label_name_embedding(args):
                     batch_hier_pos_ids = torch.LongTensor([-1] + batch_label_classes + [-1])
                     batch_position_ids = torch.zeros_like(batch_hier_pos_ids)
 
+                    hier_pos_emb_weight = hier_pos_emb.weight.data
                     
-                    
-                    updated_batch_emb, hier_pos_emb = train_batch_labels(
+                    updated_batch_emb, hier_pos_emb_weight = train_batch_labels(
                         args, tokenizer, batch_input_ids, batch_attention_mask,
                         batch_position_ids, batch_init_label_emb, 
-                        batch_label_child_set, batch_label_parent_dic,batch_position_ids,hier_pos_emb
+                        batch_label_child_set, batch_label_parent_dic,batch_hier_pos_ids,hier_pos_emb_weight
                     )
                     trained_label_emb[batch_original_indices] = updated_batch_emb
                     batch_idx += 1
-                    # TODO debug
-                    if batch_idx > 1:
-                        break
+                    # # TODO debug
+                    # if batch_idx > 2:
+                    #     break
             
                 init_label_emb = trained_label_emb.detach().cpu()
-                hier_pos_emb = hier_pos_emb.detach().cpu()
+                # hier_pos_emb = hier_pos_emb.detach().cpu()
                 torch.save(init_label_emb, label_emb_cache_path)
                 torch.save(hier_pos_emb, hier_pos_emb_cache_path)
         
