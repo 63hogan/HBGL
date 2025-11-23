@@ -83,7 +83,10 @@ def eval_output(pred_data_path, true_data_path='/root/autodl-tmp/HBGL/data/ztfDa
             j = len(pred_data) - 1
         cls_accuracy, true_max_level = evaluate_cls_accuracy(pred_data[j], true_data[i])
         all_true_cls_levels.update([f'level_{j}_match' for j in range(1, true_max_level + 1)])
-        results.append({**cls_accuracy, 'true_max_level': true_max_level})
+
+        level_1_label = true_data[i][0] if len(true_data[i]) > 0 else None
+        
+        results.append({**cls_accuracy, 'true_max_level': true_max_level, 'root_category': level_1_label})
 
 
 
@@ -115,4 +118,47 @@ def eval_output(pred_data_path, true_data_path='/root/autodl-tmp/HBGL/data/ztfDa
             print(f"  {key}: {acc:.4f} (based on {count} samples)")
             level_accuracies.append(acc)
             levels.append(f'Level {i}')
+            
+            
+# --- Part 2: 按 Level 1 大类进行细分统计 (新增部分) ---
+    print("\n" + "="*40)
+    print("BREAKDOWN BY LEVEL 1 CATEGORY:")
     
+    # 按 root_category 分组
+    # 排除 'Unknown' (如果存在空标签数据)
+    valid_groups = df_results[df_results['root_category'] != "Unknown"].groupby('root_category')
+    
+    # 按类别名称排序输出
+    for cat_name, group_df in sorted(valid_groups, key=lambda x: x[0]):
+        print(f"\n>>> Category: {cat_name} (Total Samples: {len(group_df)})")
+        
+        # 1. 该类别的完全匹配率
+        exact_acc = group_df['exact_match'].mean()
+        print(f"   Exact Match: {exact_acc:.4f}")
+        
+        # 2. 该类别下每一层的准确率
+        # 注意：分母应该是该类别下，Ground Truth 确实拥有该层级的数据量
+        for i in range(1, max_level_overall + 1):
+            col_match = f'level_{i}_match'
+            
+            # 如果这一列不存在于当前group (比如该类都很浅)，跳过
+            if col_match not in group_df.columns:
+                continue
+                
+            # 分母：该组中，真实深度 >= i 的样本数
+            # 因为只有真实深度 >= i，我们才统计了 level_i_match (无论是0还是1)
+            # 在 evaluate_cls_accuracy 中，如果层级不够，字典里是不会有那个key的? 
+            # 不，原代码里字典初始化只到了 true_max_level。
+            # Pandas转换后，缺失值会是 NaN (或者 0，取决于填充)。
+            # 这里最稳妥的方法是看 true_max_level >= i
+            
+            valid_sample_count = len(group_df[group_df['true_max_level'] >= i])
+            
+            if valid_sample_count > 0:
+                # 分子：匹配成功的数量 (fillna(0)防止NaN干扰，虽然上面过滤了)
+                match_count = group_df.loc[group_df['true_max_level'] >= i, col_match].sum()
+                acc = match_count / valid_sample_count
+                print(f"   Level {i}: {acc:.4f} ({match_count}/{valid_sample_count})")
+            else:
+                # 该类别下没有这么深的数据
+                pass

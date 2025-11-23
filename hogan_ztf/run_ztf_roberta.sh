@@ -24,4 +24,4 @@ MODEL_PATH=/root/.cache/huggingface/hub/models--hfl--chinese-roberta-wwm-ext-lar
     --learning_rate 7e-5 --num_warmup_steps 500 --num_training_steps -1 --cache_dir ${CACHE_DIR}\
     --soft_label --seed ${seed} \
     --label_cpt ./data/WebOfScience/wos.taxnomy --label_cpt_not_incr_mask_ratio --label_cpt_steps 300 --label_cpt_use_bce \
-    --load_label_embedding_cache    ; /usr/bin/shutdown
+    --load_label_embedding_cache    #; /usr/bin/shutdown

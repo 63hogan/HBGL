@@ -921,8 +921,8 @@ def test_main(save_path):
 
 
 def main():
-    args = start_train()
-    save_path = get_chkpt_directories(args.output_dir)
+    # args = start_train()
+    save_path = get_chkpt_directories("/root/autodl-tmp/HBGL/hogan_ztf/roberta_model/hier_pos_lr_7e-5")
     logging.info(f"找到的检查点目录: {save_path}")
     test_main(save_path)
 
