@@ -1255,9 +1255,16 @@ class BertForSeq2SeqDecoder(PreTrainedBertModel):
             last_hidden = new_encoded_layers[-1][:, -1:, :]
             prediction_scores, _ = self.cls(
                 last_hidden, None, task_idx=task_idx)
-            _, max_ids = torch.max(prediction_scores, dim=-1)
-            output_ids.append(max_ids)
+            # _, max_ids = torch.max(prediction_scores, dim=-1)
+            # output_ids.append(max_ids)
 
+            # 新代码: 取前5个概率最高的id (Top-K)
+            # prediction_scores 维度通常是 [batch_size, 1, vocab_size]
+            _, top_ids = torch.topk(prediction_scores, k=5, dim=-1)
+            
+            # top_ids 维度为 [batch_size, 1, 5]，挤压中间的维度变成 [batch_size, 5]
+            return top_ids.squeeze(1)
+        
             if self.pos_shift:
                 if prev_embedding is None:
                     prev_embedding = new_embedding

@@ -24,7 +24,7 @@ from transformers.tokenization_bert import whitespace_tokenize
 import ztf_s2s_ft.s2s_loader as seq2seq_loader
 from ztf_s2s_ft.utils import load_and_cache_examples
 from transformers import BertTokenizer
-from ztf_eval import eval_output
+from ztf_eval import eval_output_topk
 TOKENIZER_CLASSES = {
     'bert': BertTokenizer,
 }
@@ -355,7 +355,7 @@ def main(flags=None):
             for l in output_lines:
                 fout.write(l)
                 fout.write("\n")
-        eval_output(fn_out)
+        eval_output_topk(fn_out)
         # import pickle
         # from eval import evaluate
         # def token_to_id(token):

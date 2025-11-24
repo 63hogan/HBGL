@@ -162,3 +162,106 @@ def eval_output(pred_data_path, true_data_path='/root/autodl-tmp/HBGL/data/ztfDa
             else:
                 # 该类别下没有这么深的数据
                 pass
+
+def eval_output_topk(pred_data_path, true_data_path='/root/autodl-tmp/HBGL/data/ztfData/eval/ori_eval_data_src_tgt.jsonl'):
+    print(f"start evaluating file: {pred_data_path}")
+    true_data = []
+    pred_data = []
+    line_count = 0
+    parse_errors = 0
+
+    def filter_strings_compact(input_str):
+        # 提取形如 __label__ 的标签
+        return [part for part in input_str.split() 
+                if part.startswith('__') and part.endswith('__') and len(part) > 4]
+
+    # 1. 加载真实标签 (True Data)
+    print(f"Loading data from {true_data_path}...")
+    try:
+        with open(true_data_path, 'r', encoding='utf-8') as f:
+            for line in f:
+                line_count += 1
+                try:
+                    item = json.loads(line)
+                    # true_data 中存储的是完整的层级路径列表，例如 ['__A__', '__B__']
+                    true_data.append(filter_strings_compact(item['tgt']))
+                except json.JSONDecodeError as e:
+                    parse_errors += 1
+                    print(f"Warning: Skipping line {line_count} due to JSON parsing error: {e}")
+                    continue
+    except FileNotFoundError:
+        print(f"Error: Input file not found at {true_data_path}")
+        return
+    except Exception as e:
+        print(f"An unexpected error occurred during file reading: {e}")
+        return
+    print(f"Loaded {len(true_data)} true records (skipped {parse_errors} lines due to parse errors).")
+
+    # 2. 加载预测标签 (Pred Data - Top 5)
+    # 假设 pred 文件每一行包含了前5个概率最高的 Level 1 标签，用空格分隔
+    try:
+        with open(pred_data_path, 'r', encoding='utf-8') as f:
+            for line in f:
+                # pred_data 中存储的是候选列表，例如 ['__Cand1__', '__Cand2__', '__Cand3__', ...]
+                pred_data.append(filter_strings_compact(line.strip()))
+    except FileNotFoundError:
+        print(f"Error: Prediction file not found at {pred_data_path}")
+        return
+    print(f"Loaded {len(pred_data)} pred records.")
+
+    results = []
+
+    # 3. 评估循环 (计算 Top-5 Hit)
+    for i in range(len(true_data)):
+        # 对齐索引，防止预测文件行数少于真实文件
+        j = i
+        if i > len(pred_data) - 1:
+            j = len(pred_data) - 1
+        
+        # 获取当前样本的真实 Level 1 标签
+        # 如果真实数据为空（没有标签），跳过或记为 None
+        if len(true_data[i]) > 0:
+            true_level_1 = true_data[i][0]
+        else:
+            continue # 没有真实标签无法评估
+
+        # 获取当前样本的预测候选集 (Top 5)
+        pred_candidates = pred_data[j]
+
+        # 核心判断：真实标签是否在预测的 Top 5 列表中
+        is_hit = 1 if true_level_1 in pred_candidates else 0
+
+        results.append({
+            'root_category': true_level_1,
+            'is_hit': is_hit
+        })
+
+    # 4. 统计结果
+    if not results:
+        print("No valid data to evaluate.")
+        return
+
+    df_results = pd.DataFrame(results)
+
+    # 计算全局准确率 (Overall Accuracy)
+    total_accuracy = df_results['is_hit'].mean()
+
+    print(f"result of {pred_data_path}:")
+    print("\n" + "="*40)
+    print(f"OVERALL LEVEL 1 TOP-5 ACCURACY: {total_accuracy:.4f}")
+    print("="*40)
+
+    # 5. 按 Level 1 大类进行细分统计
+    print("\nBREAKDOWN BY LEVEL 1 CATEGORY (Top-5 Hit Rate):")
+    
+    # 按 root_category 分组
+    valid_groups = df_results.groupby('root_category')
+    
+    # 按照类别名称排序输出
+    # key=lambda x: x[0] 是按分组的键(类别名)排序
+    for cat_name, group_df in sorted(valid_groups, key=lambda x: x[0]):
+        total_samples = len(group_df)
+        hit_count = group_df['is_hit'].sum()
+        acc = group_df['is_hit'].mean()
+        
+        print(f"Category: {cat_name:<20} | Accuracy: {acc:.4f} ({hit_count}/{total_samples})")
